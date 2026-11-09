@@ -44,26 +44,27 @@ RUN mkdir -p /var/www/html/backups /var/www/html/logs \
     && chmod 775 /var/www/html/backups /var/www/html/logs
 
 # Setup cron jobs
-RUN echo "0 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/check_expired_clients.php >> /var/log/cron.log 2>&1" > /etc/cron.d/amnezia-cron \
-    && echo "0 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/check_traffic_limits.php >> /var/log/cron.log 2>&1" >> /etc/cron.d/amnezia-cron \
-    && echo "*/30 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/sync_ldap_users.php >> /var/log/ldap_sync.log 2>&1" >> /etc/cron.d/amnezia-cron \
+RUN echo "0 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/check_expired_clients.php >> /var/www/html/logs/cron.log 2>&1" > /etc/cron.d/amnezia-cron \
+    && echo "0 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/check_traffic_limits.php >> /var/www/html/logs/cron.log 2>&1" >> /etc/cron.d/amnezia-cron \
+    && echo "*/30 * * * * www-data cd /var/www/html && /usr/local/bin/php bin/sync_ldap_users.php >> /var/www/html/logs/ldap_sync.log 2>&1" >> /etc/cron.d/amnezia-cron \
     && echo "*/3 * * * * root /bin/bash /var/www/html/bin/monitor_metrics.sh >> /var/log/metrics_monitor.log 2>&1" >> /etc/cron.d/amnezia-cron \
+    && echo "* * * * * www-data cd /var/www/html && /usr/local/bin/php bin/process_jobs.php >> /var/www/html/logs/cron.log 2>&1" >> /etc/cron.d/amnezia-cron \
     && chmod 0644 /etc/cron.d/amnezia-cron \
-    && crontab /etc/cron.d/amnezia-cron \
-    && touch /var/log/cron.log \
     && touch /var/log/metrics_monitor.log \
-    && touch /var/log/metrics_collector.log \
-    && touch /var/log/ldap_sync.log
+    && touch /var/log/metrics_collector.log
 
 # Make monitor script executable
 RUN chmod +x /var/www/html/bin/monitor_metrics.sh
 
 # Create startup script
 RUN echo '#!/bin/bash\n\
+# /etc/cron.d/amnezia-cron is read by cron; do not install it into root crontab\n\
+crontab -r 2>/dev/null || true\n\
 service cron start\n\
 # Ensure writable directories exist with correct ownership\n\
 mkdir -p /var/www/html/backups /var/www/html/logs\n\
-chown www-data:www-data /var/www/html/backups /var/www/html/logs\n\
+touch /var/www/html/logs/cron.log /var/www/html/logs/ldap_sync.log\n\
+chown -R www-data:www-data /var/www/html/backups /var/www/html/logs\n\
 chmod 775 /var/www/html/backups /var/www/html/logs\n\
 # Ensure www-data can talk to host docker socket if mounted\n\
 if [ -S /var/run/docker.sock ]; then\n\

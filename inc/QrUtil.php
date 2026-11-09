@@ -55,6 +55,125 @@ class QrUtil
         throw new RuntimeException('QR library not available');
     }
 
+    /**
+     * Keys allowed by AmneziaWG / amneziawg-apple TunnelConfiguration+WgQuickConfig parser.
+     */
+    private static function amneziaWgInterfaceKeys(): array
+    {
+        return [
+            'privatekey', 'listenport', 'address', 'dns', 'mtu',
+            'jc', 'jmin', 'jmax', 's1', 's2', 's3', 's4',
+            'h1', 'h2', 'h3', 'h4', 'i1', 'i2', 'i3', 'i4', 'i5',
+            'headerprotectionkey', 'contentpaddingaddition', 'rekeyaftertime', 'rekeytimeout',
+            'rejectaftertime', 'keepalivetimeout', 'maxhandshakeattempts', 'randomtrailers', 'disablecookies',
+        ];
+    }
+
+    private static function amneziaWgPeerKeys(): array
+    {
+        return [
+            'publickey', 'presharedkey', 'allowedips', 'endpoint', 'persistentkeepalive',
+        ];
+    }
+
+    /**
+     * Strip unsupported keys and empty values so AmneziaWG iOS QR import succeeds.
+     */
+    public static function normalizeConfigForAmneziaWg(string $conf): string
+    {
+        $conf = stripcslashes($conf);
+        $lines = preg_split('/\r\n|\r|\n/', $conf) ?: [];
+        $section = '';
+        $out = [];
+        $interfaceKeys = array_flip(self::amneziaWgInterfaceKeys());
+        $peerKeys = array_flip(self::amneziaWgPeerKeys());
+        $multiValueKeys = ['address' => true, 'allowedips' => true, 'dns' => true];
+
+        foreach ($lines as $line) {
+            if (($hashPos = strpos($line, '#')) !== false) {
+                $line = substr($line, 0, $hashPos);
+            }
+            $trimmed = trim($line);
+            if ($trimmed === '') {
+                if ($out !== [] && end($out) !== '') {
+                    $out[] = '';
+                }
+                continue;
+            }
+
+            $lower = strtolower($trimmed);
+            if ($lower === '[interface]') {
+                $section = 'interface';
+                $out[] = '[Interface]';
+                continue;
+            }
+            if ($lower === '[peer]') {
+                $section = 'peer';
+                if ($out !== [] && end($out) !== '') {
+                    $out[] = '';
+                }
+                $out[] = '[Peer]';
+                continue;
+            }
+
+            if (strpos($trimmed, '=') === false) {
+                continue;
+            }
+
+            [$keyPart, $valuePart] = array_map('trim', explode('=', $trimmed, 2));
+            $keyLower = strtolower($keyPart);
+            $value = $valuePart;
+
+            if ($value === '') {
+                continue;
+            }
+
+            if ($section === 'interface') {
+                if (!isset($interfaceKeys[$keyLower])) {
+                    continue;
+                }
+            } elseif ($section === 'peer') {
+                if (!isset($peerKeys[$keyLower])) {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+
+            // Merge duplicate keys (Address, AllowedIPs, DNS)
+            $merged = false;
+            foreach ($out as $i => $existing) {
+                if ($existing === '' || strpos($existing, '=') === false) {
+                    continue;
+                }
+                [$ek, $ev] = array_map('trim', explode('=', $existing, 2));
+                if (strtolower($ek) === $keyLower && isset($multiValueKeys[$keyLower])) {
+                    $out[$i] = $keyPart . ' = ' . $ev . ', ' . $value;
+                    $merged = true;
+                    break;
+                }
+            }
+            if (!$merged) {
+                $out[] = $keyPart . ' = ' . $value;
+            }
+        }
+
+        // Trim trailing blank lines
+        while ($out !== [] && end($out) === '') {
+            array_pop($out);
+        }
+
+        return implode("\n", $out) . "\n";
+    }
+
+    /**
+     * QR image (data URI) with plain wg-quick config for AmneziaWG apps.
+     */
+    public static function pngBase64FromWgQuickConfig(string $conf): string
+    {
+        return self::pngBase64(self::normalizeConfigForAmneziaWg($conf));
+    }
+
     private static function urlsafe_b64_encode(string $bytes): string
     {
         return rtrim(strtr(base64_encode($bytes), '+/', '-_'), '=');
@@ -94,7 +213,7 @@ class QrUtil
     public static function encodeVpnUrlPayload(string $confText, string $protocolSlug = ''): string
     {
         if ($protocolSlug === 'awg2') {
-            return self::encodeVpnUrlConf($confText);
+            return self::encodeVpnUrlConf($confText, $protocolSlug);
         }
         
         // For other protocols, use old format with vpn:// prefix
@@ -302,6 +421,15 @@ class QrUtil
             'S2' => null,
             'S3' => null,
             'S4' => null,
+            'HeaderProtectionKey' => null,
+            'ContentPaddingAddition' => null,
+            'RekeyAfterTime' => null,
+            'RekeyTimeout' => null,
+            'RejectAfterTime' => null,
+            'KeepaliveTimeout' => null,
+            'MaxHandshakeAttempts' => null,
+            'RandomTrailers' => null,
+            'DisableCookies' => null,
         ];
         foreach (explode("\n", $conf) as $line) {
             $line = trim($line);
@@ -331,6 +459,15 @@ class QrUtil
             'S2' => (string) ($params['S2'] ?? ''),
             'S3' => (string) ($params['S3'] ?? ''),
             'S4' => (string) ($params['S4'] ?? ''),
+            'HeaderProtectionKey' => (string) ($params['HeaderProtectionKey'] ?? ''),
+            'ContentPaddingAddition' => (string) ($params['ContentPaddingAddition'] ?? ''),
+            'RekeyAfterTime' => (string) ($params['RekeyAfterTime'] ?? ''),
+            'RekeyTimeout' => (string) ($params['RekeyTimeout'] ?? ''),
+            'RejectAfterTime' => (string) ($params['RejectAfterTime'] ?? ''),
+            'KeepaliveTimeout' => (string) ($params['KeepaliveTimeout'] ?? ''),
+            'MaxHandshakeAttempts' => (string) ($params['MaxHandshakeAttempts'] ?? ''),
+            'RandomTrailers' => (string) ($params['RandomTrailers'] ?? ''),
+            'DisableCookies' => (string) ($params['DisableCookies'] ?? ''),
             'allowed_ips' => $allowedIps ?: ['0.0.0.0/0', '::/0'],
             'clientId' => $clientPubKey ?: '',
             'client_ip' => preg_replace('/\/(\d{1,2})$/', '', (string) ($address ?? '')),
@@ -462,6 +599,15 @@ class QrUtil
             'S2' => null,
             'S3' => null,
             'S4' => null,
+            'HeaderProtectionKey' => null,
+            'ContentPaddingAddition' => null,
+            'RekeyAfterTime' => null,
+            'RekeyTimeout' => null,
+            'RejectAfterTime' => null,
+            'KeepaliveTimeout' => null,
+            'MaxHandshakeAttempts' => null,
+            'RandomTrailers' => null,
+            'DisableCookies' => null,
         ];
         foreach (explode("\n", $conf) as $line) {
             $line = trim($line);
@@ -491,6 +637,15 @@ class QrUtil
             'S2' => (string) ($params['S2'] ?? ''),
             'S3' => (string) ($params['S3'] ?? ''),
             'S4' => (string) ($params['S4'] ?? ''),
+            'HeaderProtectionKey' => (string) ($params['HeaderProtectionKey'] ?? ''),
+            'ContentPaddingAddition' => (string) ($params['ContentPaddingAddition'] ?? ''),
+            'RekeyAfterTime' => (string) ($params['RekeyAfterTime'] ?? ''),
+            'RekeyTimeout' => (string) ($params['RekeyTimeout'] ?? ''),
+            'RejectAfterTime' => (string) ($params['RejectAfterTime'] ?? ''),
+            'KeepaliveTimeout' => (string) ($params['KeepaliveTimeout'] ?? ''),
+            'MaxHandshakeAttempts' => (string) ($params['MaxHandshakeAttempts'] ?? ''),
+            'RandomTrailers' => (string) ($params['RandomTrailers'] ?? ''),
+            'DisableCookies' => (string) ($params['DisableCookies'] ?? ''),
             'allowed_ips' => $allowedIps ?: ['0.0.0.0/0', '::/0'],
             'clientId' => $clientPubKey ?: '',
             'client_ip' => preg_replace('/\/(\d{1,2})$/', '', (string) ($address ?? '')),
@@ -513,6 +668,7 @@ class QrUtil
                 [
                     // awg first, then container (as in the working QR)
                     'awg' => [
+                        'isThirdPartyConfig' => true,
                         'H1' => (string) ($params['H1'] ?? ''),
                         'H2' => (string) ($params['H2'] ?? ''),
                         'H3' => (string) ($params['H3'] ?? ''),
@@ -533,7 +689,16 @@ class QrUtil
                         'I5' => (string) ($params['I5'] ?? ''),
                         'S3' => (string) ($params['S3'] ?? ''),
                         'S4' => (string) ($params['S4'] ?? ''),
-                        'protocol_version' => '2',
+                        'HeaderProtectionKey' => (string) ($params['HeaderProtectionKey'] ?? ''),
+                        'ContentPaddingAddition' => (string) ($params['ContentPaddingAddition'] ?? ''),
+                        'RekeyAfterTime' => (string) ($params['RekeyAfterTime'] ?? ''),
+                        'RekeyTimeout' => (string) ($params['RekeyTimeout'] ?? ''),
+                        'RejectAfterTime' => (string) ($params['RejectAfterTime'] ?? ''),
+                        'KeepaliveTimeout' => (string) ($params['KeepaliveTimeout'] ?? ''),
+                        'MaxHandshakeAttempts' => (string) ($params['MaxHandshakeAttempts'] ?? ''),
+                        'RandomTrailers' => (string) ($params['RandomTrailers'] ?? ''),
+                        'DisableCookies' => (string) ($params['DisableCookies'] ?? ''),
+                        'protocol_version' => '3',
                         'subnet_address' => (string) ($address ? (preg_match('/^(\d+\.\d+\.\d+)\.\d+/', $address, $m) ? $m[1] . '.0' : '10.8.1.0') : '10.8.1.0'),
                     ] : []),
                     'container' => $protocolSlug === 'awg2' ? 'amnezia-awg2' : 'amnezia-awg',

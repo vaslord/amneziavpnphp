@@ -52,7 +52,20 @@
     {{ import_message.text }}
   </div>
   {% endif %}
+
+  {% if pending_job_id %}
+  <div id="jobStatusBanner" class="mb-6 bg-blue-50 border border-blue-300 text-blue-900 px-4 py-3 rounded flex items-center gap-3">
+    <i class="fas fa-spinner fa-spin"></i>
+    <span id="jobStatusText">Операция выполняется…</span>
+  </div>
+  {% endif %}
   
+  {% if user.role == 'admin' %}
+  <div id="socks5JobStatus" role="status" aria-live="polite" class="mb-4 border rounded px-4 py-3 text-sm {% if not socks5_job or socks5_job.status == 'done' %}hidden{% endif %}">
+    {% if socks5_job and socks5_job.status == 'failed' %}SOCKS5: {{ socks5_job.error_message }}{% else %}Операция SOCKS5 ожидает выполнения…{% endif %}
+  </div>
+  {% endif %}
+
   <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
     <div class="bg-white rounded shadow p-6">
       <h3 class="font-bold mb-4">{{ t('servers.server_info') }}</h3>
@@ -98,6 +111,29 @@
                 {% if sp.server_host %}<span>Host: {{ sp.server_host }}</span>{% endif %}
                 {% if sp.server_port %}<span class="ml-2">Port: {{ sp.server_port }}</span>{% endif %}
               </div>
+              {% if sp.slug == 'socks5' and user.role == 'admin' %}
+              <div class="mt-3 space-y-2 text-sm">
+                <p class="text-gray-600">Один общий профиль для браузера и Telegram · TCP</p>
+                {% for field in [
+                  {id: 'socks5Host', label: 'Адрес', value: sp.server_host, secret: false},
+                  {id: 'socks5Port', label: 'Порт', value: sp.server_port, secret: false},
+                  {id: 'socks5Username', label: 'Логин', value: sp.extras.username, secret: false},
+                  {id: 'socks5Password', label: 'Пароль', value: sp.extras.password, secret: true},
+                  {id: 'socks5Uri', label: 'Строка подключения', value: sp.socks5_links.uri, secret: true}
+                ] %}
+                <div>
+                  <label for="{{ field.id }}" class="block text-xs text-gray-600">{{ field.label }}</label>
+                  <div class="flex flex-wrap gap-2">
+                    <input id="{{ field.id }}" type="{{ field.secret ? 'password' : 'text' }}" value="{{ field.value }}" readonly autocomplete="off" class="min-w-0 flex-1 border rounded px-2 py-1 font-mono text-xs">
+                    {% if field.secret %}<button type="button" data-socks5-reveal="{{ field.id }}" aria-pressed="false" class="text-blue-600 text-xs">Показать</button>{% endif %}
+                    <button type="button" data-socks5-copy="{{ field.id }}" class="text-blue-600 text-xs">Копировать</button>
+                  </div>
+                </div>
+                {% endfor %}
+                <a href="{{ sp.socks5_links.telegram }}" class="inline-block text-blue-600 hover:underline">Подключить в Telegram</a>
+                <span id="socks5CopyStatus" role="status" class="text-xs text-gray-600"></span>
+              </div>
+              {% endif %}
               {% if sp.slug == 'cf-warp' %}
               {# ── WARP Status Widget ── #}
               <div id="warpStatusWidget" class="mt-3 p-3 rounded-lg" style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);">
@@ -200,7 +236,7 @@
         <div>
           <label class="block text-sm text-gray-600 mb-1">{{ t('ai.protocol_type') }}</label>
           <select name="protocol_id" class="w-full px-3 py-2 border rounded">
-            {% for sp in server_protocols %}
+            {% for sp in client_protocols %}
               <option value="{{ sp.protocol_id }}">{{ sp.name }}</option>
             {% endfor %}
           </select>
@@ -291,7 +327,7 @@
           <label class="text-sm text-gray-600">{{ t('ai.protocol_type') }}</label>
           <select name="protocol_id" class="px-3 py-2 border rounded" onchange="this.form.submit()">
             <option value="">Все</option>
-            {% for sp in server_protocols %}
+            {% for sp in client_protocols %}
               <option value="{{ sp.protocol_id }}" {% if selected_protocol_id == sp.protocol_id %}selected{% endif %}>{{ sp.name }}</option>
             {% endfor %}
           </select>
@@ -439,6 +475,88 @@
 </div>
 
 <script>
+let socks5PollTimer = null;
+function setSocks5Busy(busy) {
+  document.querySelectorAll('#activateProtocolBtn, #uninstallAllBtn, .btn-uninstall-sp').forEach(button => {
+    button.disabled = busy;
+    if (!busy) {
+      button.style.opacity = '1';
+      button.style.cursor = '';
+      if (button.id === 'activateProtocolBtn') button.textContent = 'Установить';
+      else if (button.id === 'uninstallAllBtn') {
+        button.textContent = 'Удалить все протоколы';
+        button.className = button.className.replace('bg-yellow-600', 'bg-gray-600');
+      } else {
+        button.textContent = 'Удалить';
+        button.className = button.className.replace('bg-yellow-600', 'bg-red-600');
+        const card = button.closest('.border.rounded');
+        if (card) card.style.opacity = '1';
+      }
+    }
+  });
+  if (!busy) document.querySelectorAll('[id^="uninstall-overlay-"]').forEach(overlay => overlay.remove());
+}
+async function watchSocks5Job(jobId) {
+  clearTimeout(socks5PollTimer);
+  const box = document.getElementById('socks5JobStatus');
+  if (!box) return;
+  box.classList.remove('hidden');
+  setSocks5Busy(true);
+  try {
+    const response = await fetch('/api/jobs/' + encodeURIComponent(jobId), { credentials: 'same-origin', cache: 'no-store' });
+    if (!response.ok) throw new Error('Не удалось получить статус (HTTP ' + response.status + ')');
+    const data = await response.json();
+    const job = data.job;
+    if (job.status === 'done') {
+      box.textContent = job.result.message || 'Операция SOCKS5 завершена';
+      setTimeout(() => location.reload(), 800);
+      return;
+    }
+    if (job.status === 'failed') {
+      box.textContent = job.error || 'Ошибка операции SOCKS5';
+      setSocks5Busy(false);
+      return;
+    }
+    const action = job.type === 'socks5_uninstall' ? 'Удаление' : 'Установка';
+    box.textContent = action + ' SOCKS5: ' + (job.status === 'pending' ? 'ожидание запуска…' : 'выполняется…') + ' Страницу можно обновить.';
+  } catch (error) {
+    box.textContent = error.message + '. Проверка будет повторена; повторно запускать установку не требуется.';
+  }
+  socks5PollTimer = setTimeout(() => watchSocks5Job(jobId), 2500);
+}
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('[data-socks5-reveal]').forEach(button => button.addEventListener('click', () => {
+    const input = document.getElementById(button.dataset.socks5Reveal);
+    const visible = input.type === 'password';
+    input.type = visible ? 'text' : 'password';
+    button.textContent = visible ? 'Скрыть' : 'Показать';
+    button.setAttribute('aria-pressed', String(visible));
+  }));
+  document.querySelectorAll('[data-socks5-copy]').forEach(button => button.addEventListener('click', async () => {
+    const input = document.getElementById(button.dataset.socks5Copy);
+    const status = document.getElementById('socks5CopyStatus');
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(input.value);
+      } else {
+        const copy = document.createElement('textarea');
+        copy.value = input.value;
+        copy.style.position = 'fixed';
+        copy.style.opacity = '0';
+        document.body.appendChild(copy);
+        try {
+          copy.select();
+          if (!document.execCommand('copy')) throw new Error('Copy failed');
+        } finally { copy.remove(); }
+      }
+      status.textContent = 'Скопировано';
+    } catch (_) { status.textContent = 'Не удалось скопировать. Покажите значение и скопируйте вручную.'; }
+  }));
+  {% if socks5_job and socks5_job.status in ['pending', 'running'] and user.role == 'admin' %}
+  watchSocks5Job({{ socks5_job.id }});
+  {% endif %}
+});
+
 async function confirmAction(btn, message) {
   if (await showConfirmModal(message)) {
     btn.closest('form').submit();
@@ -481,6 +599,10 @@ document.addEventListener('DOMContentLoaded', function() {
       try {
         const res = await fetch(`/servers/{{ server.id }}/protocols/uninstall-all`, { method: 'POST', credentials: 'same-origin' });
         const data = await res.json();
+        if (res.ok && data.job_id) {
+          watchSocks5Job(data.job_id);
+          return;
+        }
         if (data.success) {
           uninstallAllBtn.innerHTML = '<i class="fas fa-check mr-1"></i>Удалено';
           uninstallAllBtn.className = uninstallAllBtn.className.replace('bg-yellow-600', 'bg-green-600');
@@ -525,6 +647,10 @@ document.addEventListener('DOMContentLoaded', function() {
         let data;
         const ct = res.headers.get('content-type') || '';
         if (ct.includes('application/json')) { data = await res.json(); } else { data = { error: await res.text() }; }
+        if (res.ok && data.job_id) {
+          watchSocks5Job(data.job_id);
+          return;
+        }
         if (res.ok && data && data.success !== false && !data.error) {
           msg2.textContent = 'Готово';
           setTimeout(() => location.reload(), 1000);
@@ -584,6 +710,10 @@ document.addEventListener('DOMContentLoaded', function() {
         let data;
         const ct = resp.headers.get('content-type') || '';
         if (ct.includes('application/json')) { data = await resp.json(); } else { data = { error: await resp.text() }; }
+        if (resp.ok && data.job_id) {
+          watchSocks5Job(data.job_id);
+          return;
+        }
         if (resp.ok && data && !data.error) {
           // Success state
           btn.innerHTML = '<i class="fas fa-check mr-1"></i>Удалено';
@@ -663,23 +793,103 @@ document.addEventListener('DOMContentLoaded', function() {
   }
 });
 
+async function pollPanelJob(jobId, onDone, onFailed) {
+  const res = await fetch(`/api/jobs/${jobId}`, { credentials: 'same-origin' });
+  const data = await res.json();
+  if (!res.ok || !data.success || !data.job) {
+    throw new Error(data.error || 'Job status unavailable');
+  }
+  const job = data.job;
+  if (job.status === 'done') {
+    onDone(job);
+    return true;
+  }
+  if (job.status === 'failed') {
+    onFailed(job);
+    return true;
+  }
+  return false;
+}
+
 async function syncAllStats(serverId) {
+  const banner = document.getElementById('jobStatusBanner');
+  const bannerText = document.getElementById('jobStatusText');
   try {
     const response = await fetch(`/servers/${serverId}/sync-stats`, {
-      method: 'POST'
+      method: 'POST',
+      credentials: 'same-origin'
     });
-    
     const data = await response.json();
-    
-    if (data.success) {
-      location.reload();
-    } else {
+    if (!data.success || !data.job_id) {
       alert('Failed to sync stats: ' + (data.error || 'Unknown error'));
+      return;
     }
+    if (banner) banner.classList.remove('hidden');
+    if (bannerText) bannerText.textContent = 'Синхронизация статистики…';
+    const jobId = data.job_id;
+    const tick = async () => {
+      try {
+        const finished = await pollPanelJob(jobId, () => location.reload(), (job) => {
+          alert('Sync failed: ' + (job.error || 'Unknown error'));
+        });
+        if (!finished) setTimeout(tick, 2000);
+      } catch (e) {
+        alert('Error: ' + e.message);
+      }
+    };
+    tick();
   } catch (error) {
     alert('Error: ' + error.message);
   }
 }
+
+{% if pending_job_id %}
+(function() {
+  const jobId = {{ pending_job_id }};
+  const banner = document.getElementById('jobStatusBanner');
+  const bannerText = document.getElementById('jobStatusText');
+  const jobLabels = {
+    client_create: 'Создание клиента…',
+    client_revoke: 'Отзыв клиента…',
+    client_restore: 'Восстановление клиента…',
+    client_delete: 'Удаление клиента…',
+    server_sync_stats: 'Синхронизация статистики…'
+  };
+  async function tick() {
+    try {
+      const finished = await pollPanelJob(jobId, (job) => {
+        const result = job.result || {};
+        if (result.redirect) {
+          window.location.href = result.redirect;
+          return;
+        }
+        const url = new URL(window.location.href);
+        url.searchParams.delete('job');
+        window.location.href = url.toString();
+      }, (job) => {
+        if (banner) {
+          banner.className = 'mb-6 bg-red-50 border border-red-300 text-red-900 px-4 py-3 rounded';
+          banner.querySelector('.fa-spinner')?.classList.replace('fa-spinner', 'fa-exclamation-circle');
+          banner.querySelector('.fa-spin')?.classList.remove('fa-spin');
+        }
+        if (bannerText) bannerText.textContent = 'Ошибка: ' + (job.error || 'операция не выполнена');
+      });
+      if (!finished) {
+        const res = await fetch(`/api/jobs/${jobId}`, { credentials: 'same-origin' });
+        const data = await res.json();
+        if (data.job && bannerText && jobLabels[data.job.type]) {
+          bannerText.textContent = jobLabels[data.job.type];
+        }
+        setTimeout(tick, 2000);
+      }
+    } catch (e) {
+      if (bannerText) bannerText.textContent = 'Ошибка опроса: ' + e.message;
+      setTimeout(tick, 3000);
+    }
+  }
+  tick();
+})();
+{% endif %}
 
 // ── WARP Status Widget ──
 function updateWarpWidget(data) {

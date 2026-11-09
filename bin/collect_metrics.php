@@ -95,6 +95,8 @@ while (true) {
                 } else {
                     echo "  No active clients\n";
                 }
+
+                ServerMonitoring::refreshOnlineClientsCache((int) $server['id']);
                 
             } catch (Exception $e) {
                 echo "  ERROR: " . $e->getMessage() . "\n";

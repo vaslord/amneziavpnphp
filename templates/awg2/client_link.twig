@@ -1,0 +1,72 @@
+{% extends "layout_public.twig" %}
+{% block title %}{{ client.name }}{% endblock %}
+{% block content %}
+<div class="max-w-4xl mx-auto px-4 py-8">
+  <div class="text-center mb-6">
+    <i class="fas fa-shield-alt text-4xl text-purple-600 mb-2"></i>
+    <h1 class="text-3xl font-bold">{{ client.name }}</h1>
+    {% if server_name %}
+    <p class="text-gray-600 mt-1">{{ server_name }}</p>
+    {% endif %}
+    {% if servers_count > 1 %}
+    <a href="/awg2/clients-links/{{ token }}" class="text-sm text-purple-600 hover:underline mt-2 inline-block">
+      <i class="fas fa-arrow-left"></i> Выбрать другой сервер
+    </a>
+    {% endif %}
+  </div>
+
+  {% if is_expired %}
+  <div class="bg-red-50 border border-red-200 text-red-800 rounded-lg p-6 text-center mb-6">
+    <i class="fas fa-clock text-2xl mb-2"></i>
+    <p class="font-semibold">Срок действия конфигурации истёк</p>
+    {% if client.expires_at %}
+    <p class="text-sm mt-1">Истекло: {{ client.expires_at }}</p>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
+    <div class="bg-white rounded shadow p-6">
+      <h3 class="font-bold mb-4">Конфигурация</h3>
+      <dl class="space-y-2 mb-4">
+        <div><dt class="text-sm text-gray-600">Статус</dt>
+          <dd><span class="px-2 py-1 bg-green-100 text-green-800 rounded text-xs">Активен</span></dd>
+        </div>
+        {% if client.expires_at %}
+        <div><dt class="text-sm text-gray-600">Действует до</dt><dd>{{ client.expires_at }}</dd></div>
+        {% endif %}
+      </dl>
+      <a href="/awg2/clients-links/{{ token }}/download/{{ client.server_id }}"
+         class="gradient-bg text-white px-4 py-2 rounded inline-block">
+        <i class="fas fa-download"></i> Скачать конфиг
+      </a>
+    </div>
+  </div>
+
+  {% if qr_code_awgwg %}
+  <div class="bg-white rounded shadow p-6 text-center mb-6">
+    <h3 class="font-bold mb-4">QR Code (AmneziaWG)</h3>
+    <img src="{{ qr_code_awgwg }}" alt="QR Code AmneziaWG" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
+    <p class="text-sm text-gray-600 mt-2">Сканируйте в приложении AmneziaWG на iPhone / Android</p>
+  </div>
+  {% endif %}
+
+  {% if qr_code_vpn_url %}
+  <div class="bg-white rounded shadow p-6 text-center mb-6">
+    <h3 class="font-bold mb-4">QR Code (Amnezia VPN)</h3>
+    <img src="{{ qr_code_vpn_url }}" alt="QR Code Amnezia VPN" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
+    <p class="text-sm text-gray-600 mt-2">Сканируйте в приложении Amnezia VPN</p>
+  </div>
+  {% endif %}
+
+  {% if vpn_url_config %}
+  <div class="bg-white rounded shadow p-6">
+    <h3 class="font-bold mb-4">VPN URL</h3>
+    <div class="bg-gray-100 p-4 rounded text-left overflow-x-auto">
+      <code class="text-sm break-all">{{ vpn_url_config }}</code>
+    </div>
+    <p class="text-sm text-gray-600 mt-2">Скопируйте vpn:// URL для импорта</p>
+  </div>
+  {% endif %}
+  {% endif %}
+</div>
+{% endblock %}

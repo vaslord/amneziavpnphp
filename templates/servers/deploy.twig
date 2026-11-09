@@ -35,7 +35,7 @@ function appendLog(message, cssClass) {
   if (cssClass) {
     line.className = cssClass;
   }
-  line.innerHTML = message;
+  line.textContent = message;
   log.appendChild(line);
   log.scrollTop = log.scrollHeight;
 }
@@ -91,7 +91,22 @@ function deploy(mode) {
     body: JSON.stringify(payload)
   })
     .then(async response => {
-      const data = await response.json().catch(() => ({ success: false, error: 'Invalid server response' }));
+      if (response.redirected) {
+        throw new Error('Session expired or request redirected. Reload the page and sign in again.');
+      }
+      const body = await response.text();
+      let data;
+      try {
+        data = JSON.parse(body);
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
+          throw new Error('Invalid response shape');
+        }
+      } catch (_) {
+        const hint = [502, 504].includes(response.status)
+          ? 'The proxy interrupted the request. The installation may still be running; check the server status before retrying.'
+          : 'Check the panel logs and server status before retrying.';
+        throw new Error('Invalid server response (HTTP ' + response.status + '). ' + hint);
+      }
       if (!response.ok && !data.requires_action) {
         throw new Error(data.error || ('HTTP ' + response.status));
       }
@@ -130,7 +145,7 @@ function deploy(mode) {
       }
     })
     .catch(error => {
-      appendLog('❌ Network error: ' + error.message, 'text-red-500 font-bold');
+      appendLog('❌ ' + error.message, 'text-red-500 font-bold');
       setButtonState(false, 'Retry Deployment');
     });
 }

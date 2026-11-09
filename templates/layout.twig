@@ -48,6 +48,9 @@
                         <a href="/servers" class="text-white hover:text-gray-200 inline-flex items-center px-1 pt-1 text-sm font-medium">
                             <i class="fas fa-server mr-2"></i>{{ t('menu.servers') }}
                         </a>
+                        <a href="/clients-awg" class="text-white hover:text-gray-200 inline-flex items-center px-1 pt-1 text-sm font-medium">
+                            <i class="fas fa-users mr-2"></i>AWG клиенты
+                        </a>
                         {% if user.role == 'admin' %}
                         <a href="/settings" class="text-white hover:text-gray-200 inline-flex items-center px-1 pt-1 text-sm font-medium">
                             <i class="fas fa-cog mr-2"></i>{{ t('menu.settings') }}
@@ -113,6 +116,9 @@
                 </a>
                 <a href="/servers" class="text-white hover:bg-purple-700 block px-3 py-2 rounded-md text-base font-medium">
                     <i class="fas fa-server mr-2"></i>{{ t('menu.servers') }}
+                </a>
+                <a href="/clients-awg" class="text-white hover:bg-purple-700 block px-3 py-2 rounded-md text-base font-medium">
+                    <i class="fas fa-users mr-2"></i>AWG клиенты
                 </a>
                 {% if user.role == 'admin' %}
                 <a href="/settings" class="text-white hover:bg-purple-700 block px-3 py-2 rounded-md text-base font-medium">

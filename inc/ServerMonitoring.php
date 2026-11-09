@@ -411,11 +411,12 @@ class ServerMonitoring
                 $bytesSent = (int) ($currentDbStats['bytes_sent'] ?? 0);
                 $bytesReceived = (int) ($currentDbStats['bytes_received'] ?? 0);
             } else {
-            // wg show all dump format (tab-separated):
+            // wg/awg show all dump format (tab-separated):
             // $1=interface $2=pubkey $3=psk $4=endpoint $5=allowed-ips $6=latest-handshake $7=rx-bytes $8=tx-bytes $9=keepalive
             // rx-bytes = bytes received by server = client's upload (bytes_sent)
             // tx-bytes = bytes transmitted by server = client's download (bytes_received)
-            $cmd = "docker exec {$containerName} wg show all dump | grep '{$publicKey}' | awk '{print \$6, \$7, \$8}'";
+            $wgTool = ($protocolSlug === 'awg2') ? 'awg' : 'wg';
+            $cmd = "docker exec {$containerName} {$wgTool} show all dump 2>/dev/null | grep '{$publicKey}' | awk '{print \$6, \$7, \$8}'";
             $result = $this->execSSH($cmd);
 
             if ($result) {
@@ -960,13 +961,15 @@ class ServerMonitoring
      */
     public function enforceAwgSingleIpPerPeer(): void
     {
-        $containerName = $this->serverData['container_name'] ?? '';
+        $installProtocol = (string) ($this->serverData['install_protocol'] ?? '');
+        $containerName = $this->resolveContainerForProtocol($installProtocol !== '' ? $installProtocol : 'amnezia-wg');
         if (strpos($containerName, 'awg') === false && strpos($containerName, 'wireguard') === false) {
             return; // Not an AWG server
         }
 
-        // Get current peer states
-        $cmd = "docker exec $containerName wg show wg0 dump";
+        $wgTool = ($installProtocol === 'awg2' || stripos($containerName, 'awg2') !== false) ? 'awg' : 'wg';
+        $iface = ($installProtocol === 'awg2' || stripos($containerName, 'awg2') !== false) ? 'awg0' : 'wg0';
+        $cmd = "docker exec $containerName {$wgTool} show {$iface} dump 2>/dev/null";
         $result = $this->execSSH($cmd);
         if (!$result) {
             return;
@@ -1169,10 +1172,47 @@ class ServerMonitoring
     }
 
     /**
-     * Get online clients for a specific server
+     * Persist online client list for server view (called from metrics collector).
+     */
+    public static function refreshOnlineClientsCache(int $serverId): void
+    {
+        try {
+            $server = new VpnServer($serverId);
+            $serverData = $server->getData();
+            if (!$serverData || ($serverData['status'] ?? '') !== 'active') {
+                return;
+            }
+            $online = self::fetchOnlineClientsForServerLive($serverData);
+            $pdo = DB::conn();
+            $stmt = $pdo->prepare('UPDATE vpn_servers SET online_clients_json = ?, online_clients_at = NOW() WHERE id = ?');
+            $stmt->execute([json_encode(array_values($online), JSON_UNESCAPED_UNICODE), $serverId]);
+        } catch (Throwable $e) {
+            error_log('refreshOnlineClientsCache failed for server ' . $serverId . ': ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get online clients for a specific server (cached when fresh).
      * Returns array of online client logins/emails
      */
-    public static function getOnlineClientsForServer(array $serverData): array
+    public static function getOnlineClientsForServer(array $serverData, int $maxAgeSeconds = 120): array
+    {
+        $cachedRaw = $serverData['online_clients_json'] ?? null;
+        $cachedAt = $serverData['online_clients_at'] ?? null;
+        if ($cachedRaw && $cachedAt) {
+            $decoded = is_string($cachedRaw) ? json_decode($cachedRaw, true) : $cachedRaw;
+            $ts = strtotime((string) $cachedAt);
+            if (is_array($decoded) && $ts !== false && (time() - $ts) <= $maxAgeSeconds) {
+                return $decoded;
+            }
+        }
+        return self::fetchOnlineClientsForServerLive($serverData);
+    }
+
+    /**
+     * Live SSH/DB lookup for online clients (no cache write).
+     */
+    private static function fetchOnlineClientsForServerLive(array $serverData): array
     {
         $result = [];
         $db = DB::conn();

@@ -27,9 +27,12 @@ require_once __DIR__ . '/../inc/JWT.php';
 require_once __DIR__ . '/../inc/PanelImporter.php';
 require_once __DIR__ . '/../inc/ServerMonitoring.php';
 require_once __DIR__ . '/../inc/BackupLibrary.php';
+require_once __DIR__ . '/../inc/AwgProtocolContext.php';
 require_once __DIR__ . '/../inc/InstallProtocolManager.php';
 require_once __DIR__ . '/../inc/ProtocolService.php';
 require_once __DIR__ . '/../inc/OpenRouterService.php';
+require_once __DIR__ . '/../inc/Awg2ClientLink.php';
+require_once __DIR__ . '/../inc/JobQueue.php';
 
 // Load environment configuration
 Config::load(__DIR__ . '/../.env');
@@ -100,6 +103,82 @@ function redirect(string $to): void
 {
     header('Location: ' . $to);
     exit;
+}
+
+function releaseSessionLock(): void
+{
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        session_write_close();
+    }
+}
+
+/** Return an async response for SOCKS5; other protocol routes retain their contracts. */
+function respondSocks5Job(int $serverId, array $protocol, string $action, array $user): bool
+{
+    if (($protocol['slug'] ?? '') !== Socks5Proxy::SLUG) return false;
+    if (!Socks5Proxy::isAdmin($user)) {
+        http_response_code(403);
+        echo json_encode(['success' => false, 'error' => 'SOCKS5 доступен только администратору']);
+        return true;
+    }
+    try {
+        $jobId = Socks5Proxy::enqueue($serverId, $action, $user);
+        http_response_code(202);
+        echo json_encode(['success' => true, 'job_id' => $jobId]);
+    } catch (RuntimeException $e) {
+        http_response_code(409);
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+    }
+    return true;
+}
+
+/** Check the entire bulk request before removing any protocol. */
+function allowBulkProtocolRemoval(int $serverId, array $protocols, array $user): bool
+{
+    try {
+        Socks5Proxy::assertBulkRemovalAllowed($serverId, $protocols, $user);
+    } catch (RuntimeException $e) {
+        http_response_code(in_array($e->getCode(), [403, 409], true) ? $e->getCode() : 500);
+        echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Render public AWG2 client link page (config, QR, download).
+ */
+function renderAwg2ClientLinkPage(array $clientRow, string $token, int $serversCount): void
+{
+    $client = new VpnClient((int) $clientRow['id']);
+    $clientData = $client->getData();
+    $isExpired = $client->isExpired();
+    $qrCodeAwgWg = '';
+    $qrCodeVpnUrl = '';
+    $vpnUrlConfig = '';
+
+    if (!$isExpired && !empty($clientData['config'])) {
+        try {
+            $qrCodeAwgWg = VpnClient::generateQRCodeAwgWg($clientData['config']);
+            $qrCodeVpnUrl = VpnClient::generateQRCodeVpnUrl($clientData['config'], 'awg2');
+            require_once __DIR__ . '/../inc/QrUtil.php';
+            $vpnUrlConfig = 'vpn://' . QrUtil::encodeVpnUrlConf($clientData['config'], 'awg2');
+        } catch (Exception $e) {
+            // Ignore QR generation errors
+        }
+    }
+
+    View::render('awg2/client_link.twig', [
+        'client' => $clientData,
+        'token' => $token,
+        'server_name' => $clientRow['server_name'] ?? '',
+        'server_host' => $clientRow['server_host'] ?? '',
+        'servers_count' => $serversCount,
+        'is_expired' => $isExpired,
+        'qr_code_awgwg' => $qrCodeAwgWg,
+        'qr_code_vpn_url' => $qrCodeVpnUrl,
+        'vpn_url_config' => $vpnUrlConfig,
+    ]);
 }
 
 // Helper function to require authentication
@@ -309,7 +388,7 @@ Router::get('/servers', function () {
 // Create server page
 Router::get('/servers/create', function () {
     requireAuth();
-    $protocols = InstallProtocolManager::listActive();
+    $protocols = Socks5Proxy::clientProtocols(InstallProtocolManager::listActive());
     $defaultProtocol = !empty($protocols) ? ($protocols[0]['slug'] ?? InstallProtocolManager::getDefaultSlug()) : InstallProtocolManager::getDefaultSlug();
     View::render('servers/create.twig', [
         'selected_mode' => 'manual',
@@ -327,7 +406,7 @@ Router::post('/servers/create', function () {
     $formData = $_POST;
     $formData['backup_upload_type'] = $_POST['backup_upload_type'] ?? 'auto';
     $formData['backup_server_index'] = $_POST['backup_server_index'] ?? '';
-    $protocols = InstallProtocolManager::listActive();
+    $protocols = Socks5Proxy::clientProtocols(InstallProtocolManager::listActive());
     $defaultProtocol = InstallProtocolManager::getDefaultSlug();
     $formData['install_protocol'] = $_POST['install_protocol'] ?? $defaultProtocol;
 
@@ -566,6 +645,9 @@ Router::get('/servers/{id}/deploy', function ($params) {
 // Deploy server action (AJAX)
 Router::post('/servers/{id}/deploy', function ($params) {
     requireAuth();
+    // Deployment is called by fetch(); keep incidental PHP output out of its JSON response.
+    @ini_set('display_errors', '0');
+    ob_start();
     header('Content-Type: application/json');
 
     $serverId = (int) $params['id'];
@@ -592,6 +674,7 @@ Router::post('/servers/{id}/deploy', function ($params) {
         $user = Auth::user();
         if ($serverData['user_id'] != $user['id'] && !Auth::isAdmin()) {
             http_response_code(403);
+            ob_clean();
             echo json_encode(['error' => 'Forbidden']);
             return;
         }
@@ -600,9 +683,11 @@ Router::post('/servers/{id}/deploy', function ($params) {
         if (!isset($result['success']) && empty($result['requires_action'])) {
             $result['success'] = true;
         }
+        ob_clean();
         echo json_encode($result, JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
-    } catch (Exception $e) {
+    } catch (Throwable $e) {
         http_response_code(500);
+        ob_clean();
         echo json_encode(['error' => $e->getMessage()], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
     }
 });
@@ -625,8 +710,14 @@ Router::post('/servers/{id}/protocols/uninstall-all', function ($params) {
         $stmt = $pdo->prepare('SELECT p.* FROM server_protocols sp JOIN protocols p ON p.id = sp.protocol_id WHERE sp.server_id = ?');
         $stmt->execute([$serverId]);
         $protocols = $stmt->fetchAll();
+        if (!allowBulkProtocolRemoval($serverId, $protocols, $user)) return;
+        $socksJobId = null;
         $removedClients = 0;
         foreach ($protocols as $protocol) {
+            if ($protocol['slug'] === 'socks5') {
+                $socksJobId = Socks5Proxy::enqueue($serverId, 'uninstall', $user);
+                continue;
+            }
             try {
                 $res = InstallProtocolManager::uninstall($server, $protocol, []);
                 $pid = (int) $protocol['id'];
@@ -639,7 +730,8 @@ Router::post('/servers/{id}/protocols/uninstall-all', function ($params) {
                 // continue with next protocol
             }
         }
-        echo json_encode(['success' => true, 'clients_removed' => $removedClients, 'message' => 'All protocols uninstalled']);
+        if ($socksJobId) http_response_code(202);
+        echo json_encode(['success' => true, 'job_id' => $socksJobId, 'clients_removed' => $removedClients, 'message' => 'All protocols uninstalled']);
     } catch (Exception $e) {
         http_response_code(404);
         echo json_encode(['success' => false, 'error' => $e->getMessage()]);
@@ -673,6 +765,7 @@ Router::post('/servers/{id}/protocols/{slug}/uninstall', function ($params) {
             return;
         }
 
+        if (respondSocks5Job($serverId, $protocol, 'uninstall', $user)) return;
         $result = InstallProtocolManager::uninstall($server, $protocol);
 
         $pdo = DB::conn();
@@ -753,6 +846,7 @@ Router::post('/servers/{id}/protocols/activate', function ($params) {
             return;
         }
 
+        if (respondSocks5Job($serverId, $protocol, 'install', $user)) return;
         $result = InstallProtocolManager::activate($server, $protocol, []);
         echo json_encode($result);
         Logger::appendInstall($serverId, 'HTTP activate finished ok');
@@ -850,7 +944,7 @@ Router::get('/servers/{id}', function ($params) {
         try {
             $stmt = $pdo->prepare('SELECT sp.protocol_id, sp.config_data, sp.applied_at, p.name, p.slug, p.description FROM server_protocols sp JOIN protocols p ON p.id = sp.protocol_id WHERE sp.server_id = ? ORDER BY p.name');
             $stmt->execute([$serverId]);
-            $serverProtocols = $stmt->fetchAll();
+            $serverProtocols = Socks5Proxy::visibleProtocols($stmt->fetchAll(), $user);
             foreach ($serverProtocols as &$sp) {
                 $cfg = [];
                 if (!empty($sp['config_data'])) {
@@ -859,6 +953,10 @@ Router::get('/servers/{id}', function ($params) {
                 $sp['server_host'] = is_array($cfg) ? ($cfg['server_host'] ?? '') : '';
                 $sp['server_port'] = is_array($cfg) ? ($cfg['server_port'] ?? '') : '';
                 $sp['extras'] = (is_array($cfg) && isset($cfg['extras']) && is_array($cfg['extras'])) ? $cfg['extras'] : [];
+                if ($sp['slug'] === 'socks5' && Socks5Proxy::isAdmin($user)) {
+                    $sp['socks5_links'] = Socks5Proxy::connectionLinks((string) $sp['server_host'], (int) $sp['server_port'], (string) ($sp['extras']['username'] ?? ''), (string) ($sp['extras']['password'] ?? ''));
+                    header('Cache-Control: no-store');
+                }
                 $sp['result_json'] = '';
                 if (is_array($sp['extras']) && isset($sp['extras']['result']) && is_array($sp['extras']['result'])) {
                     $sp['result_json'] = json_encode($sp['extras']['result'], JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
@@ -869,7 +967,7 @@ Router::get('/servers/{id}', function ($params) {
             $serverProtocols = [];
         }
 
-        $allActive = InstallProtocolManager::listActive();
+        $allActive = Socks5Proxy::visibleProtocols(InstallProtocolManager::listActive(), $user);
         $installedIds = array_map(function ($row) {
             return (int) $row['protocol_id'];
         }, $serverProtocols);
@@ -931,6 +1029,11 @@ Router::get('/servers/{id}', function ($params) {
         // Get online clients for this server (Xray)
         $onlineLogins = ServerMonitoring::getOnlineClientsForServer($serverData);
 
+        $pendingJobId = isset($_GET['job']) ? (int) $_GET['job'] : null;
+        if ($pendingJobId <= 0) {
+            $pendingJobId = null;
+        }
+
         View::render('servers/view.twig', [
             'server' => $serverData,
             'clients' => $clients,
@@ -939,6 +1042,9 @@ Router::get('/servers/{id}', function ($params) {
             'selected_protocol_id' => $selectedProtocolId,
             'available_protocols' => $availableProtocols,
             'online_logins' => $onlineLogins,
+            'pending_job_id' => $pendingJobId,
+            'socks5_job' => Socks5Proxy::isAdmin($user) ? Socks5Proxy::latestJob($serverId) : null,
+            'client_protocols' => Socks5Proxy::clientProtocols($serverProtocols),
         ]);
     } catch (Exception $e) {
         error_log('Server view error: ' . $e->getMessage() . ' at ' . $e->getFile() . ':' . $e->getLine());
@@ -1166,17 +1272,278 @@ Router::post('/servers/{id}/clients/create', function ($params) {
                 $protocolId = null;
             }
         }
-        $clientId = VpnClient::create($serverId, $user['id'], $clientName, $expiresInDays, $protocolId, $username, $login);
+        $jobId = JobQueue::enqueue('client_create', [
+            'server_id' => $serverId,
+            'client_name' => $clientName,
+            'expires_in_days' => $expiresInDays,
+            'protocol_id' => $protocolId,
+            'username' => $username,
+            'login' => $login,
+            'traffic_limit_bytes' => $trafficLimitBytes,
+        ], (int) $user['id'], $serverId);
 
-        // Set traffic limit if specified
-        if ($trafficLimitBytes !== null && $trafficLimitBytes > 0) {
-            $client = new VpnClient($clientId);
-            $client->setTrafficLimit($trafficLimitBytes);
-        }
-
-        redirect('/clients/' . $clientId);
+        releaseSessionLock();
+        redirect('/servers/' . $serverId . '?job=' . $jobId);
     } catch (Exception $e) {
         redirect('/servers/' . $serverId . '?error=' . urlencode($e->getMessage()));
+    }
+});
+
+// AWG2 clients (aggregated across servers)
+Router::get('/clients-awg', function () {
+    requireAuth();
+    $user = Auth::user();
+    $userId = (int) $user['id'];
+
+    $rows = VpnClient::listAwg2ByUser($userId);
+    $groups = VpnClient::groupAwg2ClientsByName($rows);
+    $awgServers = VpnClient::listServersWithAwg2($userId);
+
+    $pendingJobId = isset($_GET['job']) ? (int) $_GET['job'] : null;
+    if ($pendingJobId <= 0) {
+        $pendingJobId = null;
+    }
+
+    $error = isset($_GET['error']) ? (string) $_GET['error'] : '';
+
+    $bulkResult = null;
+    $resultJobId = isset($_GET['result_job']) ? (int) $_GET['result_job'] : 0;
+    if ($resultJobId > 0) {
+        $job = JobQueue::get($resultJobId);
+        if ($job && ($job['type'] ?? '') === 'client_bulk_assign' && JobQueue::canUserView($job, $user)) {
+            $bulkResult = JobQueue::decodeResult($job);
+        }
+    }
+
+    View::render('clients_awg/index.twig', [
+        'groups' => $groups,
+        'awg_servers' => $awgServers,
+        'pending_job_id' => $pendingJobId,
+        'error' => $error,
+        'bulk_result' => $bulkResult,
+    ]);
+});
+
+Router::post('/clients-awg/create', function () {
+    requireAuth();
+    $user = Auth::user();
+    $userId = (int) $user['id'];
+
+    $clientName = trim($_POST['name'] ?? '');
+    $login = isset($_POST['login']) ? trim($_POST['login']) : '';
+    $serverIds = isset($_POST['server_ids']) && is_array($_POST['server_ids'])
+        ? array_map('intval', $_POST['server_ids'])
+        : [];
+
+    $expiresInDays = null;
+    if (!empty($_POST['expires_in_seconds'])) {
+        $expiresInDays = (int) ceil((int) $_POST['expires_in_seconds'] / 86400);
+    } elseif (!empty($_POST['expires_in_days']) && $_POST['expires_in_days'] !== 'custom') {
+        $expiresInDays = (int) $_POST['expires_in_days'];
+    }
+
+    $trafficLimitBytes = null;
+    if (!empty($_POST['traffic_limit_mb'])) {
+        $trafficLimitBytes = (int) ((float) $_POST['traffic_limit_mb'] * 1048576);
+    } elseif (!empty($_POST['traffic_limit_gb']) && $_POST['traffic_limit_gb'] !== 'custom') {
+        $trafficLimitBytes = (int) ((float) $_POST['traffic_limit_gb'] * 1073741824);
+    }
+
+    if ($clientName === '') {
+        redirect('/clients-awg?error=' . urlencode('Укажите имя клиента'));
+        return;
+    }
+
+    $serverIds = array_values(array_unique(array_filter($serverIds, static fn (int $id): bool => $id > 0)));
+    if ($serverIds === []) {
+        redirect('/clients-awg?error=' . urlencode('Выберите хотя бы один сервер'));
+        return;
+    }
+
+    $awgProtocol = InstallProtocolManager::getBySlug('awg2');
+    $awgProtocolId = $awgProtocol ? (int) ($awgProtocol['id'] ?? 0) : 0;
+    if ($awgProtocolId <= 0) {
+        redirect('/clients-awg?error=' . urlencode('Протокол AWG2 не найден'));
+        return;
+    }
+
+    $lastJobId = null;
+    try {
+        $pdo = DB::conn();
+        foreach ($serverIds as $serverId) {
+            $server = new VpnServer($serverId);
+            $serverData = $server->getData();
+            if ($serverData['user_id'] != $userId && !Auth::isAdmin()) {
+                continue;
+            }
+            $chk = $pdo->prepare('
+                SELECT 1 FROM server_protocols sp
+                INNER JOIN protocols p ON p.id = sp.protocol_id AND p.slug = \'awg2\'
+                WHERE sp.server_id = ?
+                LIMIT 1
+            ');
+            $chk->execute([$serverId]);
+            if (!$chk->fetchColumn()) {
+                continue;
+            }
+
+            $lastJobId = JobQueue::enqueue('client_create', [
+                'server_id' => $serverId,
+                'client_name' => $clientName,
+                'expires_in_days' => $expiresInDays,
+                'protocol_id' => $awgProtocolId,
+                'username' => '',
+                'login' => $login,
+                'traffic_limit_bytes' => $trafficLimitBytes,
+            ], $userId, $serverId);
+        }
+
+        releaseSessionLock();
+        if ($lastJobId) {
+            redirect('/clients-awg?job=' . $lastJobId);
+        } else {
+            redirect('/clients-awg?error=' . urlencode('Не удалось создать клиента на выбранных серверах'));
+        }
+    } catch (Exception $e) {
+        redirect('/clients-awg?error=' . urlencode($e->getMessage()));
+    }
+});
+
+Router::post('/clients-awg/assign', function () {
+    requireAuth();
+    $user = Auth::user();
+    $userId = (int) $user['id'];
+    $serverId = (int) ($_POST['server_id'] ?? 0);
+    $names = isset($_POST['client_names']) && is_array($_POST['client_names'])
+        ? array_values(array_unique(array_filter(array_map(static fn ($name): string => trim((string) $name), $_POST['client_names']))))
+        : [];
+    $expiresInDays = isset($_POST['expires_in_days']) && (int) $_POST['expires_in_days'] > 0
+        ? (int) $_POST['expires_in_days']
+        : null;
+    $trafficLimitBytes = isset($_POST['traffic_limit_gb']) && (float) $_POST['traffic_limit_gb'] > 0
+        ? (int) round((float) $_POST['traffic_limit_gb'] * 1073741824)
+        : null;
+
+    if ($serverId <= 0 || $names === []) {
+        redirect('/clients-awg?error=' . urlencode('Выберите сервер и хотя бы одного клиента'));
+        return;
+    }
+    try {
+        $server = new VpnServer($serverId);
+        $serverData = $server->getData();
+        if (!$serverData || (int) ($serverData['user_id'] ?? 0) !== $userId || ($serverData['status'] ?? '') !== 'active') {
+            throw new RuntimeException('Сервер недоступен');
+        }
+        $protocol = InstallProtocolManager::getBySlug('awg2');
+        $protocolId = (int) ($protocol['id'] ?? 0);
+        if ($protocolId <= 0) {
+            throw new RuntimeException('Протокол AWG2 не найден');
+        }
+        $pdo = DB::conn();
+        $installed = $pdo->prepare('SELECT 1 FROM server_protocols WHERE server_id = ? AND protocol_id = ?');
+        $installed->execute([$serverId, $protocolId]);
+        if (!$installed->fetchColumn()) {
+            throw new RuntimeException('На выбранном сервере не установлен AWG2');
+        }
+        foreach ($names as $name) {
+            if (VpnClient::findAwg2IdsByUserAndName($userId, $name) === []) {
+                throw new RuntimeException('Клиент недоступен: ' . $name);
+            }
+        }
+        $jobId = JobQueue::enqueue('client_bulk_assign', [
+            'server_id' => $serverId,
+            'protocol_id' => $protocolId,
+            'client_names' => $names,
+            'expires_in_days' => $expiresInDays,
+            'traffic_limit_bytes' => $trafficLimitBytes,
+        ], $userId, $serverId);
+        releaseSessionLock();
+        redirect('/clients-awg?job=' . $jobId);
+    } catch (Throwable $e) {
+        redirect('/clients-awg?error=' . urlencode($e->getMessage()));
+    }
+});
+
+Router::post('/clients-awg/revoke-all', function () {
+    requireAuth();
+    $user = Auth::user();
+    $userId = (int) $user['id'];
+    $clientName = trim($_POST['client_name'] ?? '');
+
+    if ($clientName === '') {
+        redirect('/clients-awg?error=' . urlencode('Не указан логин клиента'));
+        return;
+    }
+
+    $ids = VpnClient::findAwg2IdsByUserAndName($userId, $clientName);
+    if ($ids === []) {
+        redirect('/clients-awg?error=' . urlencode('Клиент не найден'));
+        return;
+    }
+
+    $lastJobId = null;
+    foreach ($ids as $clientId) {
+        try {
+            $client = new VpnClient($clientId);
+            $clientData = $client->getData();
+            if ($clientData['user_id'] != $userId && !Auth::isAdmin()) {
+                continue;
+            }
+            if (($clientData['status'] ?? '') !== 'active') {
+                continue;
+            }
+            $serverId = (int) $clientData['server_id'];
+            $lastJobId = JobQueue::enqueue('client_revoke', ['client_id' => $clientId], $userId, $serverId);
+        } catch (Exception $e) {
+            error_log('clients-awg revoke-all: ' . $e->getMessage());
+        }
+    }
+
+    releaseSessionLock();
+    if ($lastJobId) {
+        redirect('/clients-awg?job=' . $lastJobId);
+    } else {
+        redirect('/clients-awg');
+    }
+});
+
+Router::post('/clients-awg/delete-all', function () {
+    requireAuth();
+    $user = Auth::user();
+    $userId = (int) $user['id'];
+    $clientName = trim($_POST['client_name'] ?? '');
+
+    if ($clientName === '') {
+        redirect('/clients-awg?error=' . urlencode('Не указан логин клиента'));
+        return;
+    }
+
+    $ids = VpnClient::findAwg2IdsByUserAndName($userId, $clientName);
+    if ($ids === []) {
+        redirect('/clients-awg?error=' . urlencode('Клиент не найден'));
+        return;
+    }
+
+    $lastJobId = null;
+    foreach ($ids as $clientId) {
+        try {
+            $client = new VpnClient($clientId);
+            $clientData = $client->getData();
+            if ($clientData['user_id'] != $userId && !Auth::isAdmin()) {
+                continue;
+            }
+            $serverId = (int) $clientData['server_id'];
+            $lastJobId = JobQueue::enqueue('client_delete', ['client_id' => $clientId], $userId, $serverId);
+        } catch (Exception $e) {
+            error_log('clients-awg delete-all: ' . $e->getMessage());
+        }
+    }
+
+    releaseSessionLock();
+    if ($lastJobId) {
+        redirect('/clients-awg?job=' . $lastJobId);
+    } else {
+        redirect('/clients-awg');
     }
 });
 
@@ -1199,6 +1566,7 @@ Router::get('/clients/{id}', function ($params) {
         $server = new VpnServer((int) $clientData['server_id']);
         $serverData = $server->getData();
         $protocolOutput = '';
+        $qrCodeAwgWg = '';
         $qrCodeVpnUrl = '';
         $vpnUrlConfig = '';
         $isAwg2 = false;
@@ -1232,27 +1600,38 @@ Router::get('/clients/{id}', function ($params) {
                 }
             }
             
-            // Generate second QR code and vpn:// config for AWG2
+            // AWG2: wg-quick QR for AmneziaWG + vpn:// QR for Amnezia VPN app
             if ($isAwg2 && !empty($clientData['config'])) {
                 try {
+                    $qrCodeAwgWg = VpnClient::generateQRCodeAwgWg($clientData['config']);
                     $qrCodeVpnUrl = VpnClient::generateQRCodeVpnUrl($clientData['config'], 'awg2');
-                    
-                    // Generate vpn:// URL string using vpn:// format (JSON + zlib)
                     require_once __DIR__ . '/../inc/QrUtil.php';
                     $vpnUrlConfig = 'vpn://' . QrUtil::encodeVpnUrlConf($clientData['config'], 'awg2');
                 } catch (Exception $e) {
-                    // Ignore errors, just don't show the second QR
+                    // Ignore errors, just don't show QR blocks
                 }
             }
         } catch (Exception $e) {
             $protocolOutput = '';
         }
+
+        $clientLinkUrl = '';
+        if ($isAwg2 && !empty($clientData['name'])) {
+            try {
+                $clientLinkUrl = Awg2ClientLink::publicUrlForClientName($clientData['name']);
+            } catch (Throwable $e) {
+                error_log('AWG2 client link URL failed: ' . $e->getMessage());
+            }
+        }
+
         View::render('clients/view.twig', [
             'client' => $clientData,
             'protocol_output' => $protocolOutput,
+            'qr_code_awgwg' => $qrCodeAwgWg,
             'qr_code_vpn_url' => $qrCodeVpnUrl,
             'vpn_url_config' => $vpnUrlConfig,
-            'is_awg2' => $isAwg2
+            'is_awg2' => $isAwg2,
+            'client_link_url' => $clientLinkUrl,
         ]);
     } catch (Exception $e) {
         http_response_code(404);
@@ -1283,18 +1662,20 @@ Router::get('/clients/{id}/download', function ($params) {
             return;
         }
 
-        // For WireGuard/AWG clients, regenerate config from current server state
-        // to avoid stale AWG parameters after reinstall/recreate.
-        // IMPORTANT: for amnezia-wg-advanced, never serve a config built with defaults.
-        try {
-            $regen = $client->regenerateConfigFromServer(true);
-            if (is_array($regen) && empty($regen['success']) && ($regen['error'] ?? '') === 'awg_params_missing') {
-                http_response_code(500);
-                echo 'AWG params are missing on server; cannot generate a valid config. Reinstall/repair AWG or check /opt/amnezia/awg/wg0.conf on the server.';
-                return;
+        $forceRefresh = isset($_GET['refresh']) && $_GET['refresh'] === '1';
+        if ($client->shouldRegenerateConfigOnDownload($forceRefresh)) {
+            try {
+                $regen = $client->regenerateConfigFromServer($forceRefresh);
+                if (is_array($regen) && empty($regen['success']) && ($regen['error'] ?? '') === 'awg_params_missing') {
+                    http_response_code(500);
+                    echo 'AWG params are missing on server; cannot generate a valid config. Reinstall/repair AWG or check /opt/amnezia/awg/wg0.conf on the server.';
+                    return;
+                }
+            } catch (Throwable $e) {
+                error_log('Failed to regenerate client config: ' . $e->getMessage());
             }
-        } catch (Throwable $e) {
-            error_log('Failed to regenerate client config: ' . $e->getMessage());
+            $client = new VpnClient($clientId);
+            $clientData = $client->getData();
         }
 
         $config = $client->getConfig();
@@ -1319,6 +1700,136 @@ Router::get('/clients/{id}/download', function ($params) {
     } catch (Exception $e) {
         http_response_code(404);
         echo 'Client not found';
+    }
+});
+
+// Public AWG2 client links (no auth)
+Router::get('/awg2/clients-links/{token}', function ($params) {
+    Awg2ClientLink::sendNoIndexHeaders();
+    $token = $params['token'] ?? '';
+
+    try {
+        $clients = Awg2ClientLink::findClientsByToken($token);
+    } catch (Throwable $e) {
+        error_log('AWG2 client link lookup failed: ' . $e->getMessage());
+        http_response_code(500);
+        echo 'Service unavailable';
+        return;
+    }
+
+    if ($clients === []) {
+        http_response_code(404);
+        echo 'Not found';
+        return;
+    }
+
+    $serversCount = count($clients);
+    $requestedServerId = isset($_GET['server_id']) ? (int) $_GET['server_id'] : 0;
+
+    if ($serversCount > 1 && $requestedServerId <= 0) {
+        $servers = [];
+        foreach ($clients as $row) {
+            $servers[] = [
+                'server_id' => (int) $row['server_id'],
+                'server_name' => $row['server_name'] ?? '',
+                'server_host' => $row['server_host'] ?? '',
+            ];
+        }
+        View::render('awg2/client_link_servers.twig', [
+            'token' => $token,
+            'client_name' => $clients[0]['name'] ?? '',
+            'servers' => $servers,
+        ]);
+        return;
+    }
+
+    $selected = $clients[0];
+    if ($requestedServerId > 0) {
+        $found = null;
+        foreach ($clients as $row) {
+            if ((int) $row['server_id'] === $requestedServerId) {
+                $found = $row;
+                break;
+            }
+        }
+        if ($found === null) {
+            http_response_code(404);
+            echo 'Not found';
+            return;
+        }
+        $selected = $found;
+    }
+
+    renderAwg2ClientLinkPage($selected, $token, $serversCount);
+});
+
+Router::get('/awg2/clients-links/{token}/download/{server_id}', function ($params) {
+    Awg2ClientLink::sendNoIndexHeaders();
+
+    while (ob_get_level()) {
+        ob_end_clean();
+    }
+
+    $token = $params['token'] ?? '';
+    $serverId = (int) ($params['server_id'] ?? 0);
+
+    try {
+        $clientRow = Awg2ClientLink::resolveClient($token, $serverId);
+    } catch (Throwable $e) {
+        error_log('AWG2 client link resolve failed: ' . $e->getMessage());
+        http_response_code(500);
+        echo 'Service unavailable';
+        return;
+    }
+
+    if ($clientRow === null) {
+        http_response_code(404);
+        echo 'Not found';
+        return;
+    }
+
+    try {
+        $client = new VpnClient((int) $clientRow['id']);
+        $clientData = $client->getData();
+
+        if ($client->isExpired()) {
+            http_response_code(403);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo 'Срок действия конфигурации истёк';
+            return;
+        }
+
+        $forceRefresh = isset($_GET['refresh']) && $_GET['refresh'] === '1';
+        if ($client->shouldRegenerateConfigOnDownload($forceRefresh)) {
+            try {
+                $regen = $client->regenerateConfigFromServer($forceRefresh);
+                if (is_array($regen) && empty($regen['success']) && ($regen['error'] ?? '') === 'awg_params_missing') {
+                    http_response_code(500);
+                    echo 'AWG params are missing on server; cannot generate a valid config. Reinstall/repair AWG or check /opt/amnezia/awg/wg0.conf on the server.';
+                    return;
+                }
+            } catch (Throwable $e) {
+                error_log('Failed to regenerate AWG2 client config: ' . $e->getMessage());
+            }
+            $client = new VpnClient((int) $clientRow['id']);
+            $clientData = $client->getData();
+        }
+
+        $config = $client->getConfig();
+        $baseName = $clientData['name'] ?? 'client';
+        $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $baseName);
+        if ($safeName === '') {
+            $safeName = 'user_' . $clientData['id'] . '_s' . $clientData['server_id'];
+        }
+        $filename = $safeName . '.conf';
+
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Disposition: attachment; filename="' . $filename . '"');
+        header('Content-Length: ' . strlen($config));
+        echo $config;
+    } catch (Exception $e) {
+        http_response_code(404);
+        echo 'Not found';
     }
 });
 
@@ -1579,11 +2090,10 @@ Router::post('/clients/{id}/revoke', function ($params) {
             return;
         }
 
-        if ($client->revoke()) {
-            redirect('/servers/' . $clientData['server_id'] . '?success=Client+revoked');
-        } else {
-            redirect('/servers/' . $clientData['server_id'] . '?error=Failed+to+revoke+client');
-        }
+        $serverId = (int) $clientData['server_id'];
+        $jobId = JobQueue::enqueue('client_revoke', ['client_id' => $clientId], (int) $user['id'], $serverId);
+        releaseSessionLock();
+        redirect('/servers/' . $serverId . '?job=' . $jobId);
     } catch (Exception $e) {
         redirect('/dashboard?error=' . urlencode($e->getMessage()));
     }
@@ -1606,11 +2116,10 @@ Router::post('/clients/{id}/restore', function ($params) {
             return;
         }
 
-        if ($client->restore()) {
-            redirect('/servers/' . $clientData['server_id'] . '?success=Client+restored');
-        } else {
-            redirect('/servers/' . $clientData['server_id'] . '?error=Failed+to+restore+client');
-        }
+        $serverId = (int) $clientData['server_id'];
+        $jobId = JobQueue::enqueue('client_restore', ['client_id' => $clientId], (int) $user['id'], $serverId);
+        releaseSessionLock();
+        redirect('/servers/' . $serverId . '?job=' . $jobId);
     } catch (Exception $e) {
         redirect('/dashboard?error=' . urlencode($e->getMessage()));
     }
@@ -1633,13 +2142,10 @@ Router::post('/clients/{id}/delete', function ($params) {
             return;
         }
 
-        $serverId = $clientData['server_id'];
-
-        if ($client->delete()) {
-            redirect('/servers/' . $serverId . '?success=Client+deleted');
-        } else {
-            redirect('/servers/' . $serverId . '?error=Failed+to+delete+client');
-        }
+        $serverId = (int) $clientData['server_id'];
+        $jobId = JobQueue::enqueue('client_delete', ['client_id' => $clientId], (int) $user['id'], $serverId);
+        releaseSessionLock();
+        redirect('/servers/' . $serverId . '?job=' . $jobId);
     } catch (Exception $e) {
         redirect('/dashboard?error=' . urlencode($e->getMessage()));
     }
@@ -1756,12 +2262,41 @@ Router::post('/servers/{id}/sync-stats', function ($params) {
             return;
         }
 
-        $synced = VpnClient::syncAllStatsForServer($serverId);
-        echo json_encode(['success' => true, 'synced' => $synced]);
+        $jobId = JobQueue::enqueue('server_sync_stats', ['server_id' => $serverId], (int) $user['id'], $serverId);
+        releaseSessionLock();
+        echo json_encode(['success' => true, 'job_id' => $jobId, 'status' => 'pending']);
     } catch (Exception $e) {
         http_response_code(500);
         echo json_encode(['error' => $e->getMessage()]);
     }
+});
+
+// Job status (session auth)
+Router::get('/api/jobs/{id}', function ($params) {
+    header('Content-Type: application/json');
+    $user = authenticateRequest();
+    if (!$user) {
+        http_response_code(401);
+        echo json_encode(['error' => 'Unauthorized']);
+        return;
+    }
+    releaseSessionLock();
+
+    $jobId = (int) ($params['id'] ?? 0);
+    $job = JobQueue::get($jobId);
+    if (!$job) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Job not found']);
+        return;
+    }
+
+    if (!JobQueue::canUserView($job, $user)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Forbidden']);
+        return;
+    }
+
+    echo json_encode(['success' => true, 'job' => JobQueue::toApiArray($job)]);
 });
 
 /**
@@ -2623,6 +3158,8 @@ Router::get('/api/servers/{id}/protocols', function ($params) {
         $stmt->execute([$serverId]);
         $rows = $stmt->fetchAll();
 
+        $rows = Socks5Proxy::visibleProtocols($rows, $user);
+        header('Cache-Control: no-store');
         echo json_encode(['success' => true, 'protocols' => $rows], JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
     } catch (Exception $e) {
         http_response_code(500);
@@ -2638,7 +3175,7 @@ Router::get('/api/protocols/active', function () {
     if (!$user)
         return;
 
-    $protocols = InstallProtocolManager::listActive();
+    $protocols = Socks5Proxy::visibleProtocols(InstallProtocolManager::listActive(), $user);
     $list = array_map(function ($p) {
         return [
             'id' => (int) ($p['id'] ?? 0),
@@ -2696,6 +3233,7 @@ Router::post('/api/servers/{id}/protocols/install', function ($params) {
             return;
         }
 
+        if (respondSocks5Job($serverId, $protocol, 'install', $user)) return;
         $result = InstallProtocolManager::activate($server, $protocol, []);
 
         // Keep API behavior consistent with UI flow: once protocol activation succeeds,
@@ -3287,12 +3825,18 @@ Router::post('/api/servers/{id}/protocols/uninstall-all', function ($params) {
         $stmt->execute([$serverId]);
         $rows = $stmt->fetchAll();
 
+        if (!allowBulkProtocolRemoval($serverId, $rows, $user)) return;
+        $socksJobId = null;
         $removedClients = 0;
         $removedBindings = 0;
         $uninstalled = [];
         $errors = [];
 
         foreach ($rows as $row) {
+            if ($row['slug'] === 'socks5') {
+                $socksJobId = Socks5Proxy::enqueue($serverId, 'uninstall', $user);
+                continue;
+            }
             $pid = (int) ($row['protocol_id'] ?? 0);
             $slug = (string) ($row['slug'] ?? '');
             if ($pid <= 0 || $slug === '') {
@@ -3323,7 +3867,9 @@ Router::post('/api/servers/{id}/protocols/uninstall-all', function ($params) {
 
         $pdo->prepare('UPDATE vpn_servers SET status = ?, error_message = NULL WHERE id = ?')->execute(['active', $serverId]);
 
+        if ($socksJobId) http_response_code(202);
         echo json_encode([
+            'job_id' => $socksJobId,
             'success' => empty($errors),
             'uninstalled' => $uninstalled,
             'errors' => $errors,
@@ -3364,6 +3910,7 @@ Router::post('/api/servers/{id}/protocols/{slug}/uninstall', function ($params) 
             return;
         }
 
+        if (respondSocks5Job($serverId, $protocol, 'uninstall', $user)) return;
         $result = InstallProtocolManager::uninstall($server, $protocol);
 
         // Cleanup bindings + clients (same behavior as UI route)

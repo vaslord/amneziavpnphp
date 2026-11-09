@@ -1,0 +1,318 @@
+{% extends "layout.twig" %}
+{% block title %}AWG клиенты{% endblock %}
+{% block content %}
+<div class="max-w-7xl mx-auto px-4 py-8">
+  <h1 class="text-3xl font-bold mb-6">AmneziaWG 3.1 — клиенты</h1>
+
+  {% if error %}
+  <div class="mb-6 bg-red-50 border border-red-400 text-red-700 px-4 py-3 rounded">
+    <i class="fas fa-exclamation-circle mr-2"></i>{{ error }}
+  </div>
+  {% endif %}
+
+  {% if bulk_result %}
+  <div class="mb-6 bg-green-50 border border-green-300 text-green-900 px-4 py-3 rounded">
+    Назначение завершено: создано {{ bulk_result.created|length }}, пропущено {{ bulk_result.skipped|length }}, ошибок {{ bulk_result.failed|length }}.
+    {% if bulk_result.skipped|length %}<div class="mt-1 text-sm">Пропущены: {% for item in bulk_result.skipped %}{{ item.name }}{% if not loop.last %}, {% endif %}{% endfor %}</div>{% endif %}
+    {% if bulk_result.failed|length %}<div class="mt-1 text-sm text-red-700">Ошибки: {% for item in bulk_result.failed %}{{ item.name }} — {{ item.error }}{% if not loop.last %}; {% endif %}{% endfor %}</div>{% endif %}
+  </div>
+  {% endif %}
+
+  {% if pending_job_id %}
+  <div id="jobStatusBanner" class="mb-6 bg-blue-50 border border-blue-300 text-blue-900 px-4 py-3 rounded flex items-center gap-3">
+    <i class="fas fa-spinner fa-spin"></i>
+    <span id="jobStatusText">Операция выполняется…</span>
+  </div>
+  {% endif %}
+
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-8">
+    <div class="lg:col-span-1 bg-white rounded shadow p-6">
+      <h3 class="font-bold mb-4">{{ t('clients.create') }}</h3>
+      {% if awg_servers|length > 0 %}
+      <form method="POST" action="/clients-awg/create" class="space-y-3" id="createAwgClientForm">
+        <div>
+          <input name="name" placeholder="{{ t('clients.name') }}" required class="w-full px-3 py-2 border rounded" id="awgClientName">
+        </div>
+        <div>
+          <input name="login" placeholder="Логин (пусто — из имени)" class="w-full px-3 py-2 border rounded" id="awgClientLogin">
+        </div>
+        <div>
+          <label class="block text-sm text-gray-600 mb-2">Серверы</label>
+          <div class="mb-2">
+            <button type="button" class="text-sm text-purple-600 hover:underline" onclick="toggleAllAwgServers(true)">Выбрать все</button>
+            <span class="text-gray-400 mx-1">|</span>
+            <button type="button" class="text-sm text-purple-600 hover:underline" onclick="toggleAllAwgServers(false)">Снять все</button>
+          </div>
+          <div class="space-y-2 max-h-48 overflow-y-auto border rounded p-3">
+            {% for srv in awg_servers %}
+            <label class="flex items-center gap-2 text-sm cursor-pointer">
+              <input type="checkbox" name="server_ids[]" value="{{ srv.id }}" class="awg-server-cb rounded">
+              <span>{{ srv.name }} <span class="text-xs text-gray-500">· AmneziaWG 3.1</span></span>
+              {% if srv.status != 'active' %}
+              <span class="text-xs text-gray-400">({{ srv.status }})</span>
+              {% endif %}
+            </label>
+            {% endfor %}
+          </div>
+        </div>
+        <div>
+          <label class="block text-sm text-gray-600 mb-1">{{ t('clients.expiration') }}</label>
+          <select name="expires_in_days" class="w-full px-3 py-2 border rounded mb-2" id="awgExpirationSelect" onchange="toggleAwgExpirationInput()">
+            <option value="" selected>{{ t('clients.never_expires') }}</option>
+            <option value="7">7 {{ t('common.days') }}</option>
+            <option value="30">30 {{ t('common.days') }}</option>
+            <option value="60">60 {{ t('common.days') }}</option>
+            <option value="90">90 {{ t('common.days') }}</option>
+            <option value="180">180 {{ t('common.days') }}</option>
+            <option value="365">365 {{ t('common.days') }}</option>
+            <option value="custom">{{ t('clients.custom_seconds') }}</option>
+          </select>
+          <input type="number" name="expires_in_seconds" id="awgExpirationSeconds" class="w-full px-3 py-2 border rounded" placeholder="{{ t('clients.enter_seconds') }}" style="display:none;" min="1">
+        </div>
+        <div>
+          <label class="block text-sm text-gray-600 mb-1">{{ t('clients.traffic_limit') }}</label>
+          <select name="traffic_limit_gb" class="w-full px-3 py-2 border rounded mb-2" id="awgTrafficSelect" onchange="toggleAwgTrafficInput()">
+            <option value="" selected>{{ t('clients.unlimited') }}</option>
+            <option value="1">1 GB</option>
+            <option value="5">5 GB</option>
+            <option value="10">10 GB</option>
+            <option value="25">25 GB</option>
+            <option value="50">50 GB</option>
+            <option value="100">100 GB</option>
+            <option value="custom">{{ t('clients.custom_mb') }}</option>
+          </select>
+          <input type="number" name="traffic_limit_mb" id="awgTrafficMegabytes" class="w-full px-3 py-2 border rounded" placeholder="{{ t('clients.enter_megabytes') }}" style="display:none;" min="1">
+        </div>
+        <button type="submit" class="gradient-bg text-white px-4 py-2 rounded w-full" id="createAwgClientBtn">
+          <span id="createAwgClientText">{{ t('form.create') }}</span>
+          <i class="fas fa-spinner fa-spin" id="createAwgClientSpinner" style="display:none;"></i>
+        </button>
+      </form>
+      {% if groups|length > 0 %}
+      <div class="border-t mt-6 pt-5">
+        <h3 class="font-bold mb-3">Добавить существующих клиентов на сервер</h3>
+        <form method="POST" action="/clients-awg/assign" class="space-y-3" id="assignAwgClientsForm">
+          <div>
+            <label class="block text-sm text-gray-600 mb-1">Целевой сервер</label>
+            <select name="server_id" required class="w-full px-3 py-2 border rounded">
+              <option value="">Выберите сервер</option>
+              {% for srv in awg_servers %}<option value="{{ srv.id }}" {% if srv.status != 'active' %}disabled{% endif %}>{{ srv.name }} · AmneziaWG 3.1{% if srv.status != 'active' %} ({{ srv.status }}){% endif %}</option>{% endfor %}
+            </select>
+          </div>
+          <div>
+            <label class="block text-sm text-gray-600 mb-1">Клиенты</label>
+            <div class="max-h-40 overflow-y-auto border rounded p-3 space-y-2">
+              {% for group in groups %}<label class="flex items-center gap-2 text-sm"><input type="checkbox" name="client_names[]" value="{{ group.name }}" class="rounded"><span>{{ group.name }}</span></label>{% endfor %}
+            </div>
+          </div>
+          <select name="expires_in_days" class="w-full px-3 py-2 border rounded">
+            <option value="">Без срока действия</option><option value="7">7 дней</option><option value="30">30 дней</option><option value="90">90 дней</option><option value="365">365 дней</option>
+          </select>
+          <input type="number" name="traffic_limit_gb" class="w-full px-3 py-2 border rounded" min="0" step="0.01" placeholder="Лимит трафика, ГБ (пусто — без лимита)">
+          <button type="submit" class="bg-purple-600 text-white px-4 py-2 rounded w-full">Добавить выбранных</button>
+        </form>
+      </div>
+      {% endif %}
+
+      {% else %}
+      <p class="text-sm text-gray-600">Нет активных серверов с установленным AmneziaWG 3.1. Завершите deployment сервера, затем он появится в этом списке.</p>
+      {% endif %}
+    </div>
+
+    <div class="lg:col-span-2 bg-white rounded shadow p-6">
+      <h3 class="font-bold mb-4">Список клиентов</h3>
+      {% if groups|length > 0 %}
+      <div class="w-full overflow-x-auto">
+      <table class="w-full" style="min-width: 720px;">
+        <thead class="bg-gray-50">
+          <tr>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Логин</th>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Серверы</th>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ t('clients.expiration') }}</th>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ t('clients.status') }}</th>
+            <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">{{ t('clients.actions') }}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for group in groups %}
+          <tr class="border-t">
+            <td class="px-4 py-4 font-medium">{{ group.name }}</td>
+            <td class="px-4 py-4 text-sm">
+              {% for inst in group.instances %}
+              <a href="/clients/{{ inst.id }}" class="text-purple-600 hover:underline block">{{ inst.server_name }}</a>
+              {% endfor %}
+            </td>
+            <td class="px-4 py-4 text-sm">
+              {% for inst in group.instances %}
+              <div class="mb-1">
+                <span class="text-gray-500">{{ inst.server_name }}:</span>
+                {% if inst.expires_at %}
+                  {% set expires_ts = inst.expires_at|date('U') %}
+                  {% set now_ts = "now"|date('U') %}
+                  {% set diff_days = ((expires_ts - now_ts) / 86400)|round %}
+                  {% if diff_days < 0 %}
+                    <span class="px-2 py-0.5 bg-red-100 text-red-800 rounded text-xs">{{ t('clients.expired') }}</span>
+                  {% elseif diff_days <= 7 %}
+                    <span class="px-2 py-0.5 bg-yellow-100 text-yellow-800 rounded text-xs">{{ diff_days }} {{ t('common.days') }}</span>
+                  {% else %}
+                    <span class="text-gray-600">{{ inst.expires_at|date('Y-m-d') }}</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-green-500" title="{{ t('clients.never_expires') }}">&infin;</span>
+                {% endif %}
+              </div>
+              {% endfor %}
+            </td>
+            <td class="px-4 py-4">
+              {% if group.status_label == 'active' %}
+                <span class="px-2 py-1 bg-green-100 text-green-800 rounded text-xs">{{ t('status.active') }}</span>
+              {% elseif group.status_label == 'disabled' %}
+                <span class="px-2 py-1 bg-red-100 text-red-800 rounded text-xs">{{ t('status.disabled') }}</span>
+              {% else %}
+                <span class="px-2 py-1 bg-yellow-100 text-yellow-800 rounded text-xs">Смешанный</span>
+              {% endif %}
+            </td>
+            <td class="px-4 py-4 text-sm whitespace-nowrap">
+              {% if group.first_id %}
+              <a href="/clients/{{ group.first_id }}" class="text-purple-600 hover:text-purple-800 mr-2">{{ t('servers.view') }}</a>
+              {% endif %}
+              {% if group.client_link_url %}
+              <a href="{{ group.client_link_url }}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:text-blue-800 mr-2">Публичная</a>
+              {% endif %}
+              {% if group.has_active %}
+              <form method="POST" action="/clients-awg/revoke-all" style="display:inline;">
+                <input type="hidden" name="client_name" value="{{ group.name }}">
+                <button type="button" class="text-orange-600 hover:text-orange-800 mr-2" onclick="confirmAction(this, 'Отозвать доступ на всех серверах?')">{{ t('clients.revoke') }} (все)</button>
+              </form>
+              {% endif %}
+              <form method="POST" action="/clients-awg/delete-all" style="display:inline;">
+                <input type="hidden" name="client_name" value="{{ group.name }}">
+                <button type="button" class="text-red-600 hover:text-red-800" onclick="confirmAction(this, '{{ t('clients.delete_confirm') }} (все серверы)')">{{ t('clients.delete') }} (все)</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      </div>
+      {% else %}
+      <p class="text-gray-500 text-center py-8">Нет AWG2 клиентов</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<script>
+async function confirmAction(btn, message) {
+  if (await showConfirmModal(message)) {
+    btn.closest('form').submit();
+  }
+}
+
+function toggleAllAwgServers(checked) {
+  document.querySelectorAll('.awg-server-cb').forEach(cb => { cb.checked = checked; });
+}
+
+function toggleAwgExpirationInput() {
+  const select = document.getElementById('awgExpirationSelect');
+  const input = document.getElementById('awgExpirationSeconds');
+  if (!select || !input) return;
+  if (select.value === 'custom') {
+    input.style.display = 'block';
+    input.required = true;
+  } else {
+    input.style.display = 'none';
+    input.required = false;
+    input.value = '';
+  }
+}
+
+function toggleAwgTrafficInput() {
+  const select = document.getElementById('awgTrafficSelect');
+  const input = document.getElementById('awgTrafficMegabytes');
+  if (!select || !input) return;
+  if (select.value === 'custom') {
+    input.style.display = 'block';
+    input.required = true;
+  } else {
+    input.style.display = 'none';
+    input.required = false;
+    input.value = '';
+  }
+}
+
+document.getElementById('createAwgClientForm')?.addEventListener('submit', function() {
+  const btn = document.getElementById('createAwgClientBtn');
+  const text = document.getElementById('createAwgClientText');
+  const spinner = document.getElementById('createAwgClientSpinner');
+  if (btn) btn.disabled = true;
+  if (text) text.style.display = 'none';
+  if (spinner) spinner.style.display = 'inline-block';
+});
+
+async function pollPanelJob(jobId, onDone, onFailed) {
+  const res = await fetch(`/api/jobs/${jobId}`, { credentials: 'same-origin' });
+  const data = await res.json();
+  if (!res.ok || !data.success || !data.job) {
+    throw new Error(data.error || 'Job status unavailable');
+  }
+  const job = data.job;
+  if (job.status === 'done') {
+    onDone(job);
+    return true;
+  }
+  if (job.status === 'failed') {
+    onFailed(job);
+    return true;
+  }
+  return false;
+}
+
+{% if pending_job_id %}
+(function() {
+  const jobId = {{ pending_job_id }};
+  const banner = document.getElementById('jobStatusBanner');
+  const bannerText = document.getElementById('jobStatusText');
+  const jobLabels = {
+    client_create: 'Создание клиента…',
+    client_bulk_assign: 'Добавление клиентов…',
+    client_revoke: 'Отзыв клиента…',
+    client_restore: 'Восстановление клиента…',
+    client_delete: 'Удаление клиента…'
+  };
+  async function tick() {
+    try {
+      const finished = await pollPanelJob(jobId, (job) => {
+        const url = new URL(window.location.href);
+        if (job.type === 'client_bulk_assign') {
+          window.location.href = '/clients-awg?result_job=' + jobId;
+          return;
+        }
+        url.searchParams.delete('job');
+        window.location.href = url.toString();
+      }, (job) => {
+        if (banner) {
+          banner.className = 'mb-6 bg-red-50 border border-red-300 text-red-900 px-4 py-3 rounded';
+          banner.querySelector('.fa-spinner')?.classList.replace('fa-spinner', 'fa-exclamation-circle');
+          banner.querySelector('.fa-spin')?.classList.remove('fa-spin');
+        }
+        if (bannerText) bannerText.textContent = 'Ошибка: ' + (job.error || 'операция не выполнена');
+      });
+      if (!finished) {
+        const res = await fetch(`/api/jobs/${jobId}`, { credentials: 'same-origin' });
+        const data = await res.json();
+        if (data.job && bannerText && jobLabels[data.job.type]) {
+          bannerText.textContent = jobLabels[data.job.type];
+        }
+        setTimeout(tick, 2000);
+      }
+    } catch (e) {
+      if (bannerText) bannerText.textContent = 'Ошибка опроса: ' + e.message;
+      setTimeout(tick, 3000);
+    }
+  }
+  tick();
+})();
+{% endif %}
+</script>
+{% endblock %}

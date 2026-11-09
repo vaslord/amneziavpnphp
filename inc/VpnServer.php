@@ -94,6 +94,9 @@ class VpnServer
         }
 
         $protocolSlug = trim((string) ($data['install_protocol'] ?? ''));
+        if ($protocolSlug === 'socks5') {
+            throw new InvalidArgumentException('SOCKS5 добавляется к существующему серверу через «Добавить протокол»');
+        }
         if ($protocolSlug === '') {
             throw new Exception('Install protocol must be selected');
         }
@@ -474,7 +477,8 @@ class VpnServer
         $needsSudo = false;
 
         // Determine auth method
-        $sshOptions = '-o LogLevel=ERROR -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no';
+        $sshOptions = '-o LogLevel=ERROR -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no'
+            . ' -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2';
         $keyFile = '';
 
         if (!empty($this->data['ssh_key'])) {

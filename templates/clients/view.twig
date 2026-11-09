@@ -144,18 +144,38 @@
     </div>
   </div>
   
-  {% if client.qr_code %}
-  <div class="bg-white rounded shadow p-6 text-center">
-    <h3 class="font-bold mb-4">QR Code (Simple)</h3>
-    <img src="{{ client.qr_code }}" alt="QR Code" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
-    <p class="text-sm text-gray-600 mt-2">Scan with Amnezia VPN app</p>
+  {% if is_awg2 and client_link_url %}
+  <div class="bg-white rounded shadow p-6 mt-6">
+    <h3 class="font-bold mb-4">Публичная ссылка</h3>
+    <p class="text-sm text-gray-600 mb-3">Клиент может получить конфиг без входа в панель. Одна ссылка на все серверы с этим логином.</p>
+    <div class="flex flex-col sm:flex-row gap-2 items-stretch sm:items-center">
+      <input type="text" readonly id="clientLinkUrl" data-path="{{ client_link_url }}" value="{{ client_link_url }}" class="flex-1 px-3 py-2 border rounded bg-gray-50 text-sm font-mono">
+      <button type="button" onclick="copyClientLink()" class="gradient-bg text-white px-4 py-2 rounded whitespace-nowrap">
+        <i class="fas fa-copy"></i> Копировать
+      </button>
+    </div>
+    <p id="clientLinkCopyStatus" class="text-sm text-green-600 mt-2 hidden">Скопировано</p>
+  </div>
+  {% endif %}
+
+  {% if is_awg2 and qr_code_awgwg %}
+  <div class="bg-white rounded shadow p-6 text-center mt-6">
+    <h3 class="font-bold mb-4">QR Code (AmneziaWG)</h3>
+    <img src="{{ qr_code_awgwg }}" alt="QR Code AmneziaWG" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
+    <p class="text-sm text-gray-600 mt-2">Scan with AmneziaWG app (iPhone / Android)</p>
   </div>
   {% endif %}
 
   {% if is_awg2 and qr_code_vpn_url %}
   <div class="bg-white rounded shadow p-6 text-center mt-6">
-    <h3 class="font-bold mb-4">QR Code (vpn:// URL)</h3>
-    <img src="{{ qr_code_vpn_url }}" alt="QR Code VPN URL" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
+    <h3 class="font-bold mb-4">QR Code (Amnezia VPN)</h3>
+    <img src="{{ qr_code_vpn_url }}" alt="QR Code Amnezia VPN" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
+    <p class="text-sm text-gray-600 mt-2">Scan with Amnezia VPN app</p>
+  </div>
+  {% elseif client.qr_code %}
+  <div class="bg-white rounded shadow p-6 text-center">
+    <h3 class="font-bold mb-4">QR Code</h3>
+    <img src="{{ client.qr_code }}" alt="QR Code" class="mx-auto" style="max-width: 300px; width: 100%; height: auto;">
     <p class="text-sm text-gray-600 mt-2">Scan with Amnezia VPN app</p>
   </div>
   {% endif %}
@@ -179,6 +199,39 @@
 </div>
 
 <script>
+function initClientLinkUrl() {
+  const input = document.getElementById('clientLinkUrl');
+  if (!input) return;
+  const path = input.dataset.path || input.value;
+  if (path && path.startsWith('/')) {
+    input.value = window.location.origin + path;
+  }
+}
+
+function copyClientLink() {
+  const input = document.getElementById('clientLinkUrl');
+  const status = document.getElementById('clientLinkCopyStatus');
+  if (!input) return;
+  const url = input.value;
+  const done = () => {
+    if (status) {
+      status.classList.remove('hidden');
+      setTimeout(() => status.classList.add('hidden'), 2000);
+    }
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(done).catch(() => {
+      input.select();
+      document.execCommand('copy');
+      done();
+    });
+  } else {
+    input.select();
+    document.execCommand('copy');
+    done();
+  }
+}
+
 function toggleExpirationEdit() {
   const select = document.getElementById('expirationSelect');
   const input = document.getElementById('expirationSeconds');
@@ -339,5 +392,7 @@ async function syncStats(clientId) {
     alert('Error: ' + error.message);
   }
 }
+
+document.addEventListener('DOMContentLoaded', initClientLinkUrl);
 </script>
 {% endblock %}

@@ -1,5 +1,6 @@
 <?php
 require_once __DIR__ . '/Logger.php';
+require_once __DIR__ . '/AwgProtocolContext.php';
 
 class InstallProtocolManager
 {
@@ -178,6 +179,9 @@ class InstallProtocolManager
     {
         $serverData = $server->getData();
         $protocolSlug = $serverData['install_protocol'] ?? null;
+        if ($protocolSlug === 'socks5') {
+            throw new InvalidArgumentException('SOCKS5 устанавливается через «Добавить протокол»');
+        }
         if (!$protocolSlug || trim((string) $protocolSlug) === '') {
             throw new Exception('Install protocol not selected');
         }
@@ -278,6 +282,7 @@ class InstallProtocolManager
                 }
             }
 
+            $options['install_mode'] = $installMode;
             return self::install($server, $protocol, $options);
         } catch (Throwable $e) {
             // Mark server error and log
@@ -350,7 +355,7 @@ class InstallProtocolManager
             $awgParams = $result['awg_params'] ?? null;
             if (!is_array($awgParams)) {
                 $flat = [];
-                foreach (['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4', 'I1', 'I2', 'I3', 'I4', 'I5'] as $k) {
+                foreach (['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4', 'I1', 'I2', 'I3', 'I4', 'I5', 'HeaderProtectionKey', 'ContentPaddingAddition', 'RekeyAfterTime', 'RekeyTimeout', 'RejectAfterTime', 'KeepaliveTimeout', 'MaxHandshakeAttempts', 'RandomTrailers', 'DisableCookies'] as $k) {
                     if (array_key_exists($k, $result) && $result[$k] !== '' && $result[$k] !== null) {
                         $flat[$k] = $result[$k];
                     }
@@ -380,7 +385,20 @@ class InstallProtocolManager
                 }
                 $extras['result'] = $result;
             }
+            if (($protocol['slug'] ?? '') === 'awg2' && empty($extras['container_name'])) {
+                $extras['container_name'] = $metadata['container_name'] ?? 'amnezia-awg2';
+            }
             self::markServerActive($serverId, null, $extras);
+            if (($protocol['slug'] ?? '') === 'awg2') {
+                try {
+                    self::repairAwg2Peers($server, $protocol);
+                } catch (Throwable $repairEx) {
+                    Logger::appendInstall($serverId, 'AWG2 repair after install: ' . $repairEx->getMessage());
+                }
+            }
+            if (($protocol['slug'] ?? '') === 'awg2' && ($options['install_mode'] ?? '') === 'reinstall') {
+                $result['client_config_refresh'] = self::refreshAwg2ClientConfigs($server);
+            }
             return $result;
         } catch (Throwable $e) {
             Logger::appendInstall($serverId, 'Scripted install failed: ' . $e->getMessage());
@@ -413,17 +431,12 @@ class InstallProtocolManager
     {
         $metadata = $protocol['definition']['metadata'] ?? [];
         $serverData = $server->getData();
-        // For multi-protocol servers, use container_name from protocol metadata first
-        // (vpn_servers.container_name stores the primary protocol's container, e.g. 'aivpn-server')
-        $containerName = $metadata['container_name'] ?? ($serverData['container_name'] ?? 'amnezia-awg');
+        $ctx = AwgProtocolContext::fromProtocolRow($protocol, $serverData);
+        $containerName = $ctx->containerName;
         $containerFilter = escapeshellarg('^' . $containerName . '$');
         $containerArg = escapeshellarg($containerName);
-
-        // AWG2 uses awg0.conf (standard, same as native Amnezia app)
-        // Old AWG uses wg0.conf
-        $isAwg2 = (stripos($containerName, 'awg2') !== false || ($protocol['slug'] ?? '') === 'awg2');
-        $configDir = '/opt/amnezia/awg';
-        $configFile = $isAwg2 ? 'awg0.conf' : 'wg0.conf';
+        $isAwg2 = $ctx->isAwg2;
+        $configDir = $ctx->containerConfigDir;
 
         $containerListRaw = trim($server->executeCommand("docker ps -a --filter name={$containerFilter} --format '{{.Names}}'", true));
         if ($containerListRaw === '') {
@@ -454,14 +467,10 @@ class InstallProtocolManager
 
         $containerState = trim($server->executeCommand("docker inspect --format '{{.State.Status}}' {$containerArg}", true));
 
-        // AWG2: try awg0.conf first (standard), fall back to wg0.conf (legacy panel installs)
-        $configFile = $isAwg2 ? 'awg0.conf' : 'wg0.conf';
+        $configFile = $ctx->resolveConfigFile(static function (string $cmd) use ($server): string {
+            return (string) $server->executeCommand($cmd, true);
+        });
         $wgConfig = $server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/{$configFile} 2>/dev/null", true);
-        if ($isAwg2 && (trim($wgConfig) === '' || strpos($wgConfig, '[Interface]') === false)) {
-            // Fallback to wg0.conf for legacy panel installs
-            $configFile = 'wg0.conf';
-            $wgConfig = $server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/{$configFile} 2>/dev/null", true);
-        }
         if (trim($wgConfig) === '' || strpos($wgConfig, '[Interface]') === false) {
             return [
                 'status' => 'partial',
@@ -474,10 +483,10 @@ class InstallProtocolManager
         }
 
         $parsedConfig = self::parseWireGuardConfig($wgConfig);
-        if (empty($parsedConfig['listen_port']) || empty($parsedConfig['awg_params'])) {
+        if (empty($parsedConfig['listen_port'])) {
             return [
                 'status' => 'partial',
-                'message' => 'Не удалось разобрать конфигурацию wg0.conf',
+                'message' => 'Не удалось разобрать ListenPort в конфигурации AWG',
                 'details' => [
                     'container_name' => $containerName,
                     'container_status' => $containerState,
@@ -485,8 +494,20 @@ class InstallProtocolManager
             ];
         }
 
+        $awgParams = $parsedConfig['awg_params'] ?? [];
+        if ($awgParams === []) {
+            $awgParams = self::extractAwgParamsFromContainerConf($server, $containerName, $configDir . '/' . $configFile);
+        }
+
         $publicKey = trim($server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/wireguard_server_public_key.key 2>/dev/null", true));
         $presharedKey = trim($server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/wireguard_psk.key 2>/dev/null", true));
+
+        if ($publicKey === '') {
+            $publicKey = self::deriveServerPublicKeyFromConfig($server, $containerArg, $wgConfig, $ctx->wgTool);
+        }
+        if ($presharedKey === '') {
+            $presharedKey = self::derivePresharedKeyFromConfig($wgConfig);
+        }
 
         if ($publicKey === '' || $presharedKey === '') {
             return [
@@ -512,7 +533,7 @@ class InstallProtocolManager
                 'vpn_port' => (int) $parsedConfig['listen_port'],
                 'server_public_key' => $publicKey,
                 'preshared_key' => $presharedKey,
-                'awg_params' => $parsedConfig['awg_params'],
+                'awg_params' => $awgParams,
                 'clients_count' => $clientsCount,
                 'summary' => sprintf('Container %s (%s), port %s, clients %d', $containerName, $containerState ?: 'unknown', $parsedConfig['listen_port'], $clientsCount)
             ]
@@ -522,26 +543,21 @@ class InstallProtocolManager
     private static function restoreBuiltinAwg(VpnServer $server, array $protocol, array $detection, array $options): array
     {
         $details = $detection['details'] ?? [];
-        $containerName = $details['container_name'] ?? ($protocol['definition']['metadata']['container_name'] ?? 'amnezia-awg');
+        $ctx = AwgProtocolContext::fromProtocolRow($protocol, $server->getData());
+        $containerName = $details['container_name'] ?? $ctx->containerName;
         $containerArg = escapeshellarg($containerName);
+        $isAwg2 = $ctx->isAwg2;
+        $configDir = $ctx->containerConfigDir;
+        $configFile = $ctx->resolveConfigFile(static function (string $cmd) use ($server): string {
+            return (string) $server->executeCommand($cmd, true);
+        });
+        $quickTool = $ctx->quickTool;
+        $configPath = "{$configDir}/{$configFile}";
 
-        // Config is always wg0.conf — container CMD runs: awg-quick up /opt/amnezia/awg/wg0.conf
-        $isAwg2 = (stripos($containerName, 'awg2') !== false || ($protocol['slug'] ?? '') === 'awg2');
-        $configDir = '/opt/amnezia/awg';
-        // AWG2: try awg0.conf first (standard), fall back to wg0.conf (legacy)
-        $configFile = $isAwg2 ? 'awg0.conf' : 'wg0.conf';
-        $testConf = trim($server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/{$configFile} 2>/dev/null", true));
-        if ($isAwg2 && ($testConf === '' || strpos($testConf, '[Interface]') === false)) {
-            $configFile = 'wg0.conf';
-        }
-
-        // Determine interface name from config filename (wg0.conf -> wg0, awg0.conf -> awg0)
-        $ifaceName = str_replace('.conf', '', $configFile);
-
-        // Try to ensure container is running and wg is up
+        // Try to ensure container is running and interface is up
         $server->executeCommand("docker start {$containerArg} 2>/dev/null || true", true);
-        $server->executeCommand("docker exec -i {$containerArg} wg-quick down {$configDir}/{$configFile} 2>/dev/null || true", true);
-        $server->executeCommand("docker exec -i {$containerArg} wg-quick up {$configDir}/{$configFile} 2>/dev/null || true", true);
+        $server->executeCommand("docker exec -i {$containerArg} {$quickTool} down {$configPath} 2>/dev/null || true", true);
+        $server->executeCommand("docker exec -i {$containerArg} {$quickTool} up {$configPath} 2>/dev/null || true", true);
 
         $pdo = DB::conn();
         $serverData = $server->getData();
@@ -761,10 +777,18 @@ class InstallProtocolManager
             $server->executeCommand("docker exec -i {$containerArg} sh -c 'echo \"$tableJson\" > {$configDir}/clientsTable'", true);
             
             // Restart WireGuard interface to apply changes
-            $server->executeCommand("docker exec -i {$containerArg} wg-quick down {$configDir}/{$configFile} 2>/dev/null || true", true);
-            $server->executeCommand("docker exec -i {$containerArg} wg-quick up {$configDir}/{$configFile} 2>/dev/null || true", true);
+            $server->executeCommand("docker exec -i {$containerArg} {$quickTool} down {$configPath} 2>/dev/null || true", true);
+            $server->executeCommand("docker exec -i {$containerArg} {$quickTool} up {$configPath} 2>/dev/null || true", true);
             
             Logger::appendInstall($serverId, "Restore: server config updated, WireGuard restarted");
+        }
+
+        if ($isAwg2) {
+            try {
+                self::repairAwg2Peers($server, $protocol);
+            } catch (Throwable $e) {
+                Logger::appendInstall($serverId, 'AWG2 repair after restore: ' . $e->getMessage());
+            }
         }
         
         Logger::appendInstall($serverId, "Restore: finished, restored={$restored}");
@@ -847,9 +871,21 @@ class InstallProtocolManager
             }
         }
 
-        $wrapper = "bash <<'EOS'\nset -eo pipefail\n" . $exportLines . $script . "\nEOS";
+        // Carry the remote exit status through executeCommand(), which returns text only.
+        $exitMarker = '__PANEL_SCRIPT_EXIT_' . bin2hex(random_bytes(12)) . '__';
+        $wrapper = "bash <<'EOS'\nset -eo pipefail\n" . $exportLines . $script . "\nEOS\n"
+            . 'panel_script_status=$?; printf "\\n' . $exitMarker . '%s\\n" "$panel_script_status"';
         Logger::appendInstall($server->getId(), strtoupper($phase) . ' phase: executing remote script');
         $output = $server->executeCommand($wrapper, true);
+        if (!preg_match('/\\n' . preg_quote($exitMarker, '/') . '(\\d+)\\s*$/', $output, $exitMatch, PREG_OFFSET_CAPTURE)) {
+            throw new RuntimeException('Remote script did not return an exit status; check the SSH connection and installation log');
+        }
+        $output = substr($output, 0, $exitMatch[0][1]);
+        $exitStatus = (int) $exitMatch[1][0];
+        if ($exitStatus !== 0) {
+            Logger::appendInstall($server->getId(), strtoupper($phase) . ' phase: script exited with status ' . $exitStatus);
+            throw new RuntimeException('Remote ' . $phase . ' script failed (exit ' . $exitStatus . '): ' . substr(trim($output), -3000));
+        }
         Logger::appendInstall($server->getId(), strtoupper($phase) . ' phase: output size ' . strlen((string) $output) . ' bytes');
         $head = substr(str_replace(["\r", "\n"], ' ', (string) $output), 0, 280);
         if ($head !== '') {
@@ -1194,10 +1230,9 @@ class InstallProtocolManager
     private static function parseWireGuardConfig(string $config): array
     {
         $lines = preg_split('/\r?\n/', $config);
-        $awgKeys = ['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4', 'I1', 'I2', 'I3', 'I4', 'I5'];
         $awgParams = [];
         $listenPort = null;
-
+        $awgKeys = ['Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4', 'I1', 'I2', 'I3', 'I4', 'I5', 'HeaderProtectionKey', 'ContentPaddingAddition', 'RekeyAfterTime', 'RekeyTimeout', 'RejectAfterTime', 'KeepaliveTimeout', 'MaxHandshakeAttempts', 'RandomTrailers', 'DisableCookies'];
         foreach ($lines as $line) {
             $line = trim($line);
             if ($line === '' || strpos($line, '=') === false) {
@@ -1216,6 +1251,60 @@ class InstallProtocolManager
             'listen_port' => $listenPort,
             'awg_params' => $awgParams
         ];
+    }
+
+    private static function extractAwgParamsFromContainerConf(VpnServer $server, string $containerName, string $confPath): array
+    {
+        $awgParams = [];
+        $awgLinesCmd = sprintf(
+            "docker exec %s sh -c \"grep -E '^[[:space:]]*(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)[[:space:]]*=' %s 2>/dev/null || true\"",
+            escapeshellarg($containerName),
+            escapeshellarg($confPath)
+        );
+        $awgLines = (string) $server->executeCommand($awgLinesCmd, true);
+        foreach (preg_split('/\r?\n/', trim($awgLines)) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            if (preg_match('/^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)\s*=\s*(.*)$/i', $line, $m)) {
+                $k = strtoupper($m[1]);
+                $value = trim($m[2]);
+                $awgParams[$k] = ctype_digit($value) ? (int) $value : $value;
+            }
+        }
+
+        return $awgParams;
+    }
+
+    private static function deriveServerPublicKeyFromConfig(
+        VpnServer $server,
+        string $containerArg,
+        string $wgConfig,
+        string $keyTool
+    ): string {
+        if (!preg_match('/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*(.+)$/mi', $wgConfig, $m)) {
+            return '';
+        }
+        $priv = trim($m[1]);
+        if ($priv === '') {
+            return '';
+        }
+        $escaped = escapeshellarg($priv);
+
+        return trim($server->executeCommand(
+            "docker exec -i {$containerArg} sh -c 'echo {$escaped} | {$keyTool} pubkey'",
+            true
+        ));
+    }
+
+    private static function derivePresharedKeyFromConfig(string $wgConfig): string
+    {
+        if (preg_match('/\[Peer\][\s\S]*?PresharedKey\s*=\s*(\S+)/i', $wgConfig, $m)) {
+            return trim($m[1]);
+        }
+
+        return '';
     }
 
     private static function hydrateProtocol(array $row): array
@@ -1256,6 +1345,7 @@ class InstallProtocolManager
 
         // ── 1. Explicit slug → handler mapping (always wins) ──
         static $slugMap = [
+            'socks5'               => 'socks5',
             // WARP
             'cf-warp'               => 'warp',
             'cloudflare-warp'       => 'warp',
@@ -1299,8 +1389,15 @@ class InstallProtocolManager
      */
     private static function getEngine(array $protocol): string
     {
+        if (($protocol['slug'] ?? '') === 'awg2') {
+            return 'shell';
+        }
+
         $handler = self::resolveHandler($protocol);
-        if ($handler === 'awg') return 'builtin_awg';
+        if ($handler === 'awg') {
+            return 'builtin_awg';
+        }
+
         return 'shell';
     }
 
@@ -1393,6 +1490,9 @@ class InstallProtocolManager
     public static function uninstall(VpnServer $server, array $protocol, array $options = []): array
     {
         $slug = $protocol['slug'] ?? 'unknown';
+        if ($slug === 'socks5') {
+            throw new InvalidArgumentException('SOCKS5 must be removed through the administrator job queue');
+        }
         $handler = self::resolveHandler($protocol);
         Logger::appendInstall($server->getId(), 'UNINSTALL: slug=' . $slug . ' handler=' . $handler);
 
@@ -1473,6 +1573,9 @@ class InstallProtocolManager
 
     public static function activate(VpnServer $server, array $protocol, array $options = []): array
     {
+        if (($protocol['slug'] ?? '') === 'socks5') {
+            throw new InvalidArgumentException('SOCKS5 must be installed through the administrator job queue');
+        }
         $engine = self::getEngine($protocol);
         $serverId = $server->getId();
         try {
@@ -2231,37 +2334,37 @@ class InstallProtocolManager
         }
 
         $serverData = $server->getData();
-        $metadata = $protocol['definition']['metadata'] ?? [];
-        $containerName = $metadata['container_name'] ?? $serverData['container_name'] ?? 'amnezia-awg';
-        // AWG2: try awg0.conf first (standard), fall back to wg0.conf (legacy)
-        $isAwg2 = (stripos($containerName, 'awg2') !== false || ($protocol['slug'] ?? '') === 'awg2');
-        $configDir = '/opt/amnezia/awg';
-        $configFile = $isAwg2 ? 'awg0.conf' : 'wg0.conf';
-        $conf = $server->executeCommand("docker exec -i $containerName cat {$configDir}/{$configFile}", true);
-        if ($isAwg2 && (!$conf || strpos($conf, '[Interface]') === false)) {
-            $configFile = 'wg0.conf';
-            $conf = $server->executeCommand("docker exec -i $containerName cat {$configDir}/{$configFile}", true);
-        }
-        if (!$conf)
+        $ctx = AwgProtocolContext::fromProtocolRow($protocol, $serverData);
+        $containerName = $ctx->containerName;
+        $configDir = $ctx->containerConfigDir;
+        $configFile = $ctx->resolveConfigFile(static function (string $cmd) use ($server): string {
+            return (string) $server->executeCommand($cmd, true);
+        });
+        $containerArg = escapeshellarg($containerName);
+        $conf = $server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/{$configFile}", true);
+        if (!$conf) {
             return;
+        }
 
         $newPeersBlock = "";
         $count = 0;
 
         foreach ($clients as $client) {
             $ip = $client['client_ip'];
-            // Check if peer already exists (simple check by IP)
+            $pub = trim((string) ($client['public_key'] ?? ''));
+            if ($pub !== '' && strpos($conf, $pub) !== false) {
+                continue;
+            }
             if (strpos($conf, $ip) !== false) {
                 continue;
             }
 
-            // Append Peer
             $newPeersBlock .= "\n[Peer]\n";
             $newPeersBlock .= "PublicKey = " . $client['public_key'] . "\n";
-            if (!empty($client['preshared_key'])) {
-                $newPeersBlock .= "PresharedKey = " . $client['preshared_key'] . "\n";
+            $psk = $client['preshared_key'] ?? ($serverData['preshared_key'] ?? '');
+            if (!empty($psk)) {
+                $newPeersBlock .= "PresharedKey = " . $psk . "\n";
             }
-            // Use AllowedIPs from DB or default to /32
             $allowed = $client['allowed_ips'] ?? "$ip/32";
             $newPeersBlock .= "AllowedIPs = $allowed\n";
             $count++;
@@ -2271,12 +2374,144 @@ class InstallProtocolManager
             Logger::appendInstall($serverId, "Syncing $count existing clients to server config");
             $conf .= $newPeersBlock;
             $escaped = addslashes($conf);
-            $server->executeCommand("docker exec -i $containerName sh -c 'echo \"$escaped\" > {$configDir}/{$configFile}'", true);
+            $configPath = "{$configDir}/{$configFile}";
+            $server->executeCommand("docker exec -i {$containerArg} sh -c 'echo \"$escaped\" > {$configPath}'", true);
 
-            // Reload interface
-            $server->executeCommand("docker exec -i $containerName wg-quick down wg0 || true", true);
-            $server->executeCommand("docker exec -i $containerName wg-quick up wg0", true);
+            $quickTool = $ctx->quickTool;
+            $server->executeCommand("docker exec -i {$containerArg} {$quickTool} down {$configPath} 2>/dev/null || true", true);
+            $server->executeCommand("docker exec -i {$containerArg} {$quickTool} up {$configPath} 2>/dev/null || true", true);
         }
+    }
+
+    /** Refresh stored client configs after an AWG2 3.1 reinstallation. */
+    private static function refreshAwg2ClientConfigs(VpnServer $server): array
+    {
+        $pdo = DB::conn();
+        $stmt = $pdo->prepare("SELECT vc.id FROM vpn_clients vc INNER JOIN protocols p ON p.id = vc.protocol_id WHERE vc.server_id = ? AND p.slug = 'awg2'");
+        $stmt->execute([$server->getId()]);
+        $refreshed = [];
+        $failed = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $clientId) {
+            try {
+                $client = new VpnClient((int) $clientId);
+                $regen = $client->regenerateConfigFromServer(true);
+                if (!empty($regen['success'])) {
+                    $refreshed[] = (int) $clientId;
+                } else {
+                    $failed[] = ['client_id' => (int) $clientId, 'error' => (string) ($regen['error'] ?? 'Configuration was not regenerated')];
+                }
+            } catch (Throwable $e) {
+                $failed[] = ['client_id' => (int) $clientId, 'error' => $e->getMessage()];
+            }
+        }
+        if ($failed !== []) {
+            Logger::appendInstall($server->getId(), 'AWG2 client config refresh warnings: ' . json_encode($failed));
+        }
+        return ['refreshed' => $refreshed, 'failed' => $failed];
+    }
+
+    /**
+     * Repair AWG2: align DB server params with awg0.conf and ensure active DB peers exist on server.
+     */
+    public static function repairAwg2Peers(VpnServer $server, ?array $protocol = null): array
+    {
+        if ($protocol === null) {
+            $protocol = self::getBySlug('awg2');
+        }
+        if (!$protocol || ($protocol['slug'] ?? '') !== 'awg2') {
+            return ['success' => false, 'error' => 'Not an AWG2 protocol'];
+        }
+
+        $serverId = $server->getId();
+        $serverData = $server->getData();
+        $ctx = AwgProtocolContext::fromProtocolRow($protocol, $serverData);
+        $containerArg = escapeshellarg($ctx->containerName);
+        $configDir = $ctx->containerConfigDir;
+
+        $configFile = $ctx->resolveConfigFile(static function (string $cmd) use ($server): string {
+            return (string) $server->executeCommand($cmd, true);
+        });
+        $configPath = "{$configDir}/{$configFile}";
+        $wgConfig = (string) $server->executeCommand("docker exec -i {$containerArg} cat {$configPath} 2>/dev/null", true);
+        if (trim($wgConfig) === '' || strpos($wgConfig, '[Interface]') === false) {
+            return ['success' => false, 'error' => 'AWG config not found in container'];
+        }
+
+        $parsed = self::parseWireGuardConfig($wgConfig);
+        $awgParams = $parsed['awg_params'] ?? [];
+        if ($awgParams === []) {
+            $awgParams = self::extractAwgParamsFromContainerConf($server, $ctx->containerName, $configPath);
+        }
+
+        $publicKey = trim($server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/wireguard_server_public_key.key 2>/dev/null", true));
+        if ($publicKey === '') {
+            $publicKey = self::deriveServerPublicKeyFromConfig($server, $containerArg, $wgConfig, $ctx->wgTool);
+        }
+        $presharedKey = trim($server->executeCommand("docker exec -i {$containerArg} cat {$configDir}/wireguard_psk.key 2>/dev/null", true));
+        if ($presharedKey === '') {
+            $presharedKey = self::derivePresharedKeyFromConfig($wgConfig);
+        }
+        $port = (int) ($parsed['listen_port'] ?? 0);
+
+        $pdo = DB::conn();
+        if ($publicKey !== '' && $port > 0) {
+            $stmt = $pdo->prepare('UPDATE vpn_servers SET server_public_key = ?, preshared_key = COALESCE(NULLIF(?, ""), preshared_key), vpn_port = ?, awg_params = ?, container_name = ? WHERE id = ?');
+            $stmt->execute([
+                $publicKey,
+                $presharedKey,
+                $port,
+                json_encode($awgParams),
+                $ctx->containerName,
+                $serverId,
+            ]);
+        }
+
+        $pid = self::resolveProtocolId($protocol);
+        $stmtClients = $pdo->prepare('
+            SELECT vc.* FROM vpn_clients vc
+            LEFT JOIN protocols p ON p.id = vc.protocol_id
+            WHERE vc.server_id = ? AND vc.status = ?
+            AND (p.slug = ? OR (vc.protocol_id IS NULL AND (SELECT install_protocol FROM vpn_servers WHERE id = ? LIMIT 1) = ?))
+        ');
+        $stmtClients->execute([$serverId, 'active', 'awg2', $serverId, 'awg2']);
+        $clients = $stmtClients->fetchAll();
+
+        require_once __DIR__ . '/VpnClient.php';
+        $server->refresh();
+        $serverData = $server->getData();
+        $serverData['container_name'] = $ctx->containerName;
+        $serverData['install_protocol'] = 'awg2';
+        $serverData['preshared_key'] = $presharedKey ?: ($serverData['preshared_key'] ?? '');
+
+        $repaired = 0;
+        foreach ($clients as $client) {
+            $pub = trim((string) ($client['public_key'] ?? ''));
+            $ip = trim((string) ($client['client_ip'] ?? ''));
+            if ($pub === '' || $ip === '') {
+                continue;
+            }
+            if (strpos($wgConfig, $pub) !== false) {
+                continue;
+            }
+            try {
+                VpnClient::addClientToServer($serverData, $pub, $ip);
+                $repaired++;
+                Logger::appendInstall($serverId, "Repair: restored peer {$ip}");
+            } catch (Throwable $e) {
+                Logger::appendInstall($serverId, "Repair: failed peer {$ip}: " . $e->getMessage());
+            }
+        }
+
+        $ifaceUp = trim($server->executeCommand($ctx->interfaceUpProbeCommand(), true));
+        if ($ifaceUp !== 'up') {
+            $server->executeCommand("docker exec -i {$containerArg} {$ctx->quickTool} up {$configPath} 2>/dev/null || true", true);
+        }
+
+        return [
+            'success' => true,
+            'repaired_peers' => $repaired,
+            'config_file' => $configFile,
+        ];
     }
 
     /**

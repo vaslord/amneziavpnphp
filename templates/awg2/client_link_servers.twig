@@ -1,0 +1,31 @@
+{% extends "layout_public.twig" %}
+{% block title %}Выбор сервера — {{ client_name }}{% endblock %}
+{% block content %}
+<div class="max-w-2xl mx-auto px-4 py-8">
+  <div class="text-center mb-8">
+    <i class="fas fa-shield-alt text-4xl text-purple-600 mb-3"></i>
+    <h1 class="text-2xl font-bold">{{ client_name }}</h1>
+    <p class="text-gray-600 mt-2">Выберите сервер для получения конфигурации</p>
+  </div>
+
+  <div class="space-y-3">
+    {% for entry in servers %}
+    <div class="bg-white rounded shadow p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+      <div>
+        <div class="font-semibold">{{ entry.server_name }}</div>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <a href="/awg2/clients-links/{{ token }}?server_id={{ entry.server_id }}"
+           class="gradient-bg text-white px-4 py-2 rounded text-sm">
+          <i class="fas fa-cog"></i> Конфигурация
+        </a>
+        <a href="/awg2/clients-links/{{ token }}/download/{{ entry.server_id }}"
+           class="border border-purple-600 text-purple-600 px-4 py-2 rounded text-sm hover:bg-purple-50">
+          <i class="fas fa-download"></i> Скачать
+        </a>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}
